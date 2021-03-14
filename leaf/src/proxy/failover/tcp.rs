@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::{io, sync::Arc, time};
 
 use async_trait::async_trait;
@@ -26,6 +25,7 @@ pub struct Handler {
 struct Measure(usize, u128); // (index, duration in millis)
 
 impl Handler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         actors: Vec<Arc<dyn OutboundHandler>>,
         fail_timeout: u32, // in secs
@@ -52,10 +52,8 @@ impl Handler {
                         debug!("health checking tcp for [{}] index [{}]", a.tag(), i);
                         let single_measure = async move {
                             let sess = Session {
-                                source: "0.0.0.0:0".parse().unwrap(),
-                                local_addr: "0.0.0.0:0".parse().unwrap(),
                                 destination: SocksAddr::Domain("www.google.com".to_string(), 80),
-                                inbound_tag: "".to_string(),
+                                ..Default::default()
                             };
                             let start = tokio::time::Instant::now();
                             match a.handle_tcp(&sess, None).await {
@@ -184,17 +182,12 @@ impl TcpOutboundHandler for Handler {
                     self.actors[*idx].tag()
                 );
                 // TODO Remove the entry immediately if timeout or fail?
-                match timeout(
+                let task = timeout(
                     time::Duration::from_secs(self.fail_timeout as u64),
                     (&self.actors[*idx]).handle_tcp(sess, None),
-                )
-                .await
-                {
-                    Ok(t) => match t {
-                        Ok(v) => return Ok(v),
-                        Err(_) => (),
-                    },
-                    Err(_) => (),
+                );
+                if let Ok(Ok(v)) = task.await {
+                    return Ok(v);
                 }
             };
         }
@@ -234,9 +227,25 @@ impl TcpOutboundHandler for Handler {
                         }
                         return Ok(v);
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        trace!(
+                            "[{}] failed to handle [{}]: {}",
+                            self.actors[actor_idx].tag(),
+                            sess.destination,
+                            e,
+                        );
+                        continue;
+                    }
                 },
-                Err(_) => continue,
+                Err(e) => {
+                    trace!(
+                        "[{}] failed to handle [{}]: {}",
+                        self.actors[actor_idx].tag(),
+                        sess.destination,
+                        e,
+                    );
+                    continue;
+                }
             }
         }
         Err(io::Error::new(

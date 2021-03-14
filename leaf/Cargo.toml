@@ -25,9 +25,11 @@ all-configs = [
 all-endpoints = [
     # inbounds
     "inbound-chain",
+    "inbound-amux",
     "inbound-ws",
     "inbound-trojan",
     "inbound-http",
+    "inbound-shadowsocks",
     "inbound-socks",
     "inbound-tun",
     # outbounds
@@ -40,12 +42,14 @@ all-endpoints = [
     "outbound-vmess",
     "outbound-tls",
     "outbound-ws",
-    "outbound-vless",
+    "outbound-amux",
+    # "outbound-vless",
     "outbound-h2",
     "outbound-failover",
     "outbound-random",
     "outbound-tryall",
     "outbound-chain",
+    "outbound-retry",
     # "outbound-stat",
 ]
 
@@ -70,28 +74,32 @@ outbound-socks = ["async-socks5"]
 outbound-trojan = ["sha2", "hex"]
 outbound-vmess = ["lz_fnv", "cfb-mode", "hmac", "aes", "sha3", "digest", "uuid", "md-5"]
 outbound-tls = []
-outbound-ws = ["tungstenite", "tokio-tungstenite", "url"]
+outbound-ws = ["tungstenite", "tokio-tungstenite", "url", "http"]
 outbound-h2 = ["h2", "http", "url"]
 outbound-vless = ["uuid"]
 outbound-failover = ["lru_time_cache"]
 outbound-random = []
 outbound-tryall = []
 outbound-chain = []
+outbound-retry = []
 outbound-stat = ["warp"]
+outbound-amux= []
 
 # Inbounds
 inbound-trojan = ["sha2", "hex"]
+inbound-shadowsocks = ["hkdf", "sha-1", "md-5"]
 inbound-socks = []
 inbound-http = ["hyper"]
 inbound-tun = ["tun"]
 inbound-ws = ["tungstenite", "tokio-tungstenite", "url", "http"]
+inbound-amux = []
 inbound-chain = []
 
 [dependencies]
 # Common
 tokio = { version = "0.2", features = ["macros", "sync", "io-util", "net", "stream"] }
 futures-util = "0.3"
-protobuf = "2.17"
+protobuf = "2.20"
 socket2 = "0.3"
 thiserror = "1.0"
 futures = "0.3"
@@ -147,7 +155,7 @@ tokio-tungstenite = { version = "0.11", optional = true }
 url = { version = "2.1", optional = true }
 
 # HTTP inbound
-hyper = { version = "0.13", default-features = false, features = [], optional = true }
+hyper = { version = "0.13.9", default-features = false, features = [], optional = true }
 
 # HTTP/2
 h2 = { version = "0.2.6", features = ["stream"], optional = true }
@@ -186,7 +194,7 @@ warp = { version = "0.2", optional = true }
 
 # TUN
 [target.'cfg(any(target_os = "ios", target_os = "macos", target_os = "linux"))'.dependencies]
-tun = { git = "https://github.com/eycorsican/rust-tun.git", branch = "fix", features = ["async"], optional = true }
+tun = { version = "0.5.1", features = ["async"], optional = true }
 
 [build-dependencies]
 cc = "1.0"

@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::SocketAddr,
     os::raw,
     pin::Pin,
     sync::{
@@ -28,7 +29,7 @@ use crate::{
     app::nat_manager::NatManager,
     app::nat_manager::UdpPacket,
     common::mutex::AtomicMutex,
-    session::{Session, SocksAddr},
+    session::{DatagramSource, Session, SocksAddr},
 };
 
 use super::lwip::*;
@@ -48,9 +49,6 @@ pub struct NetStackImpl {
     nat_manager: Arc<NatManager>,
     fakedns: Arc<TokioMutex<FakeDns>>,
 }
-
-unsafe impl Sync for NetStackImpl {}
-unsafe impl Send for NetStackImpl {}
 
 impl NetStackImpl {
     pub fn new(
@@ -107,36 +105,26 @@ impl NetStackImpl {
                 let inbound_tag_1 = inbound_tag_1.clone();
 
                 tokio::spawn(async move {
-                    let mut sess = if fakedns.lock().await.is_fake_ip(&stream.remote_addr().ip()) {
-                        match fakedns
+                    let mut sess = Session {
+                        source: stream.local_addr().to_owned(),
+                        local_addr: stream.remote_addr().to_owned(),
+                        destination: SocksAddr::Ip(*stream.remote_addr()),
+                        inbound_tag: inbound_tag_1.clone(),
+                        ..Default::default()
+                    };
+
+                    if fakedns.lock().await.is_fake_ip(&stream.remote_addr().ip()) {
+                        if let Some(domain) = fakedns
                             .lock()
                             .await
                             .query_domain(&stream.remote_addr().ip())
                         {
-                            Some(domain) => Session {
-                                source: stream.local_addr().to_owned(),
-                                local_addr: stream.remote_addr().to_owned(),
-                                destination: SocksAddr::Domain(domain, stream.remote_addr().port()),
-                                inbound_tag: inbound_tag_1.clone(),
-                            },
-                            None => Session {
-                                source: stream.local_addr().to_owned(),
-                                local_addr: stream.remote_addr().to_owned(),
-                                destination: SocksAddr::Ip(*stream.remote_addr()),
-                                inbound_tag: inbound_tag_1.clone(),
-                            },
+                            sess.destination =
+                                SocksAddr::Domain(domain, stream.remote_addr().port());
                         }
-                    } else {
-                        Session {
-                            source: stream.local_addr().to_owned(),
-                            local_addr: stream.remote_addr().to_owned(),
-                            destination: SocksAddr::Ip(*stream.remote_addr()),
-                            inbound_tag: inbound_tag_1.clone(),
-                        }
-                    };
+                    }
 
-                    // dispatch err logging was handled in dispatcher
-                    let _ = dispatcher
+                    dispatcher
                         .dispatch_tcp(&mut sess, TcpStream::new(stream))
                         .await;
                 });
@@ -149,26 +137,21 @@ impl NetStackImpl {
         tokio::spawn(async move {
             let mut listener = UdpListener::new();
             let nat_manager = nat_manager.clone();
-            let fakedns = fakedns.clone();
+            let fakedns2 = fakedns.clone();
             let pcb = listener.pcb();
 
+            // Sending packets to TUN should be very fast.
             let (client_ch_tx, mut client_ch_rx): (
                 TokioSender<UdpPacket>,
                 TokioReceiver<UdpPacket>,
-            ) = tokio_channel(100);
+            ) = tokio_channel(32);
 
             // downlink
             let lwip_lock2 = lwip_lock.clone();
             tokio::spawn(async move {
                 while let Some(pkt) = client_ch_rx.recv().await {
-                    let src_addr = match pkt.src_addr {
-                        Some(a) => match a {
-                            SocksAddr::Ip(a) => a,
-                            _ => {
-                                warn!("unexpected domain addr");
-                                continue;
-                            }
-                        },
+                    let socks_src_addr = match pkt.src_addr {
+                        Some(a) => a,
                         None => {
                             warn!("unexpected none src addr");
                             continue;
@@ -187,14 +170,33 @@ impl NetStackImpl {
                             continue;
                         }
                     };
+                    let src_addr = match socks_src_addr {
+                        SocksAddr::Ip(a) => a,
+
+                        // If the socket gives us a domain source address,
+                        // we assume there must be a paired fake IP, otherwise
+                        // we have no idea how to deal with it.
+                        SocksAddr::Domain(domain, port) => {
+                            // TODO we're doing this for every packet! optimize needed
+                            // trace!("downlink querying fake ip for domain {}", &domain);
+                            if let Some(ip) = fakedns2.lock().await.query_fake_ip(&domain) {
+                                SocketAddr::new(ip, port)
+                            } else {
+                                warn!(
+                                    "unexpected domain src addr {}:{} without paired fake IP",
+                                    &domain, &port
+                                );
+                                continue;
+                            }
+                        }
+                    };
                     send_udp(lwip_lock2.clone(), &src_addr, &dst_addr, pcb, &pkt.data[..]);
                 }
 
-                // client_ch_tx will not be dropped unless the listener loop
-                // below exit, which should never happen, so the client_ch_rx
-                // loop should never end.
                 error!("unexpected udp downlink ended");
             });
+
+            let fakedns2 = fakedns.clone();
 
             while let Some(pkt) = listener.next().await {
                 let src_addr = match pkt.src_addr {
@@ -225,7 +227,7 @@ impl NetStackImpl {
                 };
 
                 if dst_addr.port() == 53 {
-                    match fakedns.lock().await.generate_fake_response(&pkt.data) {
+                    match fakedns2.lock().await.generate_fake_response(&pkt.data) {
                         Ok(resp) => {
                             send_udp(lwip_lock.clone(), &dst_addr, &src_addr, pcb, resp.as_ref());
                             continue;
@@ -236,27 +238,41 @@ impl NetStackImpl {
                     }
                 }
 
-                if !nat_manager.contains_key(&src_addr).await {
+                // We're sending UDP packets to a fake IP, and there should be a paired domain,
+                // that said, the application connects a UDP socket with a domain address.
+                // It also means the back packets on this UDP session shall only come from a
+                // single source address.
+                let socks_dst_addr = if fakedns2.lock().await.is_fake_ip(&dst_addr.ip()) {
+                    // TODO we're doing this for every packet! optimize needed
+                    // trace!("uplink querying domain for fake ip {}", &dst_addr.ip(),);
+                    if let Some(domain) = fakedns2.lock().await.query_domain(&dst_addr.ip()) {
+                        SocksAddr::Domain(domain, dst_addr.port())
+                    } else {
+                        SocksAddr::Ip(dst_addr)
+                    }
+                } else {
+                    SocksAddr::Ip(dst_addr)
+                };
+
+                let dgram_src = DatagramSource::new(src_addr, None);
+
+                if !nat_manager.contains_key(&dgram_src).await {
                     let sess = Session {
-                        source: src_addr,
-                        local_addr: "0.0.0.0:0".parse().unwrap(),
-                        destination: SocksAddr::Ip(dst_addr),
+                        source: dgram_src.address,
+                        destination: socks_dst_addr.clone(),
                         inbound_tag: inbound_tag.clone(),
+                        ..Default::default()
                     };
 
-                    if nat_manager
-                        .add_session(&sess, src_addr, client_ch_tx.clone())
-                        .await
-                        .is_err()
-                    {
-                        // dispatch err logging was handled in dispatcher
-                        continue; // in case the pkt was sent to drop, err is returned immediately
-                    }
+                    nat_manager
+                        .add_session(&sess, dgram_src, client_ch_tx.clone())
+                        .await;
 
+                    // Note that subsequent packets on this session may have different
+                    // destination addresses.
                     debug!(
-                        "udp session {}:{} -> {}:{} ({})",
-                        &src_addr.ip(),
-                        &src_addr.port(),
+                        "added udp session {} -> {}:{} ({})",
+                        &dgram_src,
                         &dst_addr.ip(),
                         &dst_addr.port(),
                         nat_manager.size().await,
@@ -265,10 +281,10 @@ impl NetStackImpl {
 
                 let pkt = UdpPacket {
                     data: pkt.data,
-                    src_addr: Some(SocksAddr::Ip(src_addr)),
-                    dst_addr: Some(SocksAddr::Ip(dst_addr)),
+                    src_addr: Some(SocksAddr::Ip(dgram_src.address)),
+                    dst_addr: Some(socks_dst_addr),
                 };
-                nat_manager.send(&src_addr, pkt).await;
+                nat_manager.send(&dgram_src, pkt).await;
             }
         });
 

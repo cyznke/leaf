@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,7 +9,6 @@ use futures::future::select_ok;
 use log::*;
 use lru::LruCache;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use trust_dns_proto::{
@@ -18,58 +18,110 @@ use trust_dns_proto::{
     rr::{record_data::RData, record_type::RecordType, Name},
 };
 
-use crate::option;
+use crate::{option, proxy::UdpConnector};
 
 pub struct DnsClient {
     bind_addr: SocketAddr,
     servers: Vec<SocketAddr>,
+    hosts: HashMap<String, Vec<IpAddr>>,
     cache: Arc<TokioMutex<LruCache<String, Vec<IpAddr>>>>,
 }
 
 impl Default for DnsClient {
     fn default() -> Self {
-        let mut dns_servers = Vec::new();
-        dns_servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53));
-        dns_servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53));
+        let servers = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53),
+        ];
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
-        let cache = Arc::new(TokioMutex::new(LruCache::<String, Vec<IpAddr>>::new(
-            option::DNS_CACHE_SIZE,
-        )));
-        DnsClient {
-            servers: dns_servers,
-            bind_addr,
-            cache,
-        }
-    }
-}
-
-impl DnsClient {
-    pub fn new(servers: Vec<SocketAddr>, bind_addr: SocketAddr) -> Self {
         let cache = Arc::new(TokioMutex::new(LruCache::<String, Vec<IpAddr>>::new(
             option::DNS_CACHE_SIZE,
         )));
         DnsClient {
             servers,
             bind_addr,
+            hosts: HashMap::new(),
+            cache,
+        }
+    }
+}
+
+impl DnsClient {
+    pub fn new(
+        servers: Vec<SocketAddr>,
+        hosts: HashMap<String, Vec<String>>,
+        bind_addr: SocketAddr,
+    ) -> Self {
+        let cache = Arc::new(TokioMutex::new(LruCache::<String, Vec<IpAddr>>::new(
+            option::DNS_CACHE_SIZE,
+        )));
+        let mut parsed_hosts = HashMap::new();
+        for (name, static_ips) in hosts.iter() {
+            let mut ips = Vec::new();
+            for ip in static_ips {
+                if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
+                    ips.push(parsed_ip);
+                }
+            }
+            parsed_hosts.insert(name.to_owned(), ips);
+        }
+        DnsClient {
+            servers,
+            bind_addr,
+            hosts: parsed_hosts,
             cache,
         }
     }
 
+    /// Updates the cache according to the IP address successfully connected.
+    pub async fn optimize_cache(&self, address: String, connected_ip: IpAddr) {
+        // Nothing to do if the target address is an IP address.
+        if address.parse::<IpAddr>().is_ok() {
+            return;
+        }
+
+        // If the connected IP is not in the first place, we should optimize it.
+        let mut new_ips = if let Some(ips) = self.cache.lock().await.get(&address) {
+            if !ips.starts_with(&[connected_ip]) && ips.contains(&connected_ip) {
+                ips.to_vec()
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+
+        // Move failed IPs to the end, the optimized vector starts with the connected IP.
+        if let Ok(idx) = new_ips.binary_search(&connected_ip) {
+            trace!("updates DNS cache item from\n{:#?}", &new_ips);
+            new_ips.rotate_left(idx);
+            trace!("to\n{:#?}", &new_ips);
+            self.cache.lock().await.put(address, new_ips);
+            trace!("updated cache");
+        }
+    }
+
     async fn query_task(
+        &self,
         request: Box<[u8]>,
         domain: &str,
         server: &SocketAddr,
         bind_addr: &SocketAddr,
     ) -> Result<Vec<IpAddr>> {
-        let mut socket = UdpSocket::bind(bind_addr).await?;
+        let mut socket = self.create_udp_socket(bind_addr).await?;
         let mut last_err = None;
-        for _i in 0..4 {
+        for _i in 0..option::MAX_DNS_RETRIES {
             debug!("looking up domain {} on {}", domain, server);
             let start = tokio::time::Instant::now();
             match socket.send_to(&request, server).await {
                 Ok(_) => {
                     let mut buf = vec![0u8; 512];
-                    match timeout(Duration::from_secs(4), socket.recv_from(&mut buf)).await {
+                    match timeout(
+                        Duration::from_secs(option::DNS_TIMEOUT),
+                        socket.recv_from(&mut buf),
+                    )
+                    .await
+                    {
                         Ok(res) => match res {
                             Ok((n, _)) => {
                                 let resp = match Message::from_vec(&buf[..n]) {
@@ -152,6 +204,20 @@ impl DnsClient {
             return Ok(ips.to_vec());
         }
 
+        // Making cache lookup a priority rather than static hosts lookup
+        // and insert the static IPs to the cache because there's a chance
+        // for the IPs in the cache to be re-ordered.
+        if !self.hosts.is_empty() {
+            if let Some(ips) = self.hosts.get(&domain) {
+                if !ips.is_empty() {
+                    if ips.len() > 1 {
+                        self.cache.lock().await.put(domain.to_owned(), ips.to_vec());
+                    }
+                    return Ok(ips.to_vec());
+                }
+            }
+        }
+
         let mut msg = Message::new();
 
         let mut fqdn = domain.clone();
@@ -178,7 +244,7 @@ impl DnsClient {
 
         let mut tasks = Vec::new();
         for server in &self.servers {
-            let t = Self::query_task(
+            let t = self.query_task(
                 msg_buf.clone().into_boxed_slice(),
                 &domain,
                 &server,
@@ -195,3 +261,5 @@ impl DnsClient {
         }
     }
 }
+
+impl UdpConnector for DnsClient {}

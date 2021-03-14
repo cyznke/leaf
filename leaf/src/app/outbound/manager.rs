@@ -6,7 +6,9 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{anyhow, Result};
 use log::*;
+use protobuf::Message;
 
 #[cfg(feature = "outbound-chain")]
 use crate::proxy::chain;
@@ -14,12 +16,16 @@ use crate::proxy::chain;
 use crate::proxy::failover;
 #[cfg(feature = "outbound-random")]
 use crate::proxy::random;
+#[cfg(feature = "outbound-retry")]
+use crate::proxy::retry;
 #[cfg(feature = "outbound-tryall")]
 use crate::proxy::tryall;
 
 #[cfg(feature = "outbound-stat")]
 use crate::proxy::stat;
 
+#[cfg(feature = "outbound-amux")]
+use crate::proxy::amux;
 #[cfg(feature = "outbound-direct")]
 use crate::proxy::direct;
 #[cfg(feature = "outbound-drop")]
@@ -43,7 +49,7 @@ use crate::proxy::ws;
 
 use crate::{
     app::dns_client::DnsClient,
-    config::{self, Outbound, DNS},
+    config::{self, Dns, Outbound},
     proxy::{self, OutboundHandler, ProxyHandlerType},
 };
 
@@ -53,30 +59,29 @@ pub struct OutboundManager {
 }
 
 impl OutboundManager {
-    pub fn new(outbounds: &protobuf::RepeatedField<Outbound>, dns: &DNS) -> Self {
+    pub fn new(outbounds: &protobuf::RepeatedField<Outbound>, dns: &Dns) -> Result<Self> {
         let mut handlers: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
         let mut default_handler: Option<String> = None;
         let mut dns_servers = Vec::new();
+        let mut dns_hosts = HashMap::new();
         for dns_server in dns.servers.iter() {
             if let Ok(ip) = dns_server.parse::<IpAddr>() {
                 dns_servers.push(SocketAddr::new(ip, 53));
             }
         }
+        for (name, ips) in dns.hosts.iter() {
+            dns_hosts.insert(name.to_owned(), ips.values.to_vec());
+        }
         if dns_servers.is_empty() {
-            panic!("no dns servers");
+            Err(anyhow!("no dns servers"))?;
         }
         let dns_bind_addr = {
             let addr = format!("{}:0", &dns.bind);
-            let addr = match SocketAddrV4::from_str(&addr) {
-                Ok(a) => a,
-                Err(e) => {
-                    error!("invalid bind addr [{}] in dns: {}", &dns.bind, e);
-                    panic!("");
-                }
-            };
+            let addr = SocketAddrV4::from_str(&addr)
+                .map_err(|e| anyhow!("invalid bind addr [{}] in dns: {}", &dns.bind, e))?;
             SocketAddr::from(addr)
         };
-        let dns_client = Arc::new(DnsClient::new(dns_servers, dns_bind_addr));
+        let dns_client = Arc::new(DnsClient::new(dns_servers, dns_hosts, dns_bind_addr));
 
         for outbound in outbounds.iter() {
             let tag = String::from(&outbound.tag);
@@ -86,29 +91,27 @@ impl OutboundManager {
             }
             let bind_addr = {
                 let addr = format!("{}:0", &outbound.bind);
-                let addr = match SocketAddrV4::from_str(&addr) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        error!(
-                            "invalid bind addr [{}] in outbound {}: {}",
-                            &outbound.bind, &outbound.tag, e
-                        );
-                        panic!("");
-                    }
-                };
+                let addr = SocketAddrV4::from_str(&addr).map_err(|e| {
+                    anyhow!(
+                        "invalid bind addr [{}] in outbound {}: {}",
+                        &outbound.bind,
+                        &outbound.tag,
+                        e
+                    )
+                })?;
                 SocketAddr::from(addr)
             };
             match outbound.protocol.as_str() {
                 #[cfg(feature = "outbound-direct")]
                 "direct" => {
                     let tcp = Box::new(direct::TcpHandler::new(bind_addr, dns_client.clone()));
-                    let udp = Box::new(direct::UdpHandler::new(bind_addr));
+                    let udp = Box::new(direct::UdpHandler::new(bind_addr, dns_client.clone()));
                     let handler = proxy::outbound::Handler::new(
                         tag.clone(),
                         colored::Color::Green,
                         ProxyHandlerType::Direct,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag.clone(), handler);
                 }
@@ -120,17 +123,16 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Red,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-redirect")]
                 "redirect" => {
-                    let settings = match protobuf::parse_from_bytes::<
-                        config::RedirectOutboundSettings,
-                    >(&outbound.settings)
-                    {
+                    let settings = match config::RedirectOutboundSettings::parse_from_bytes(
+                        &outbound.settings,
+                    ) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -140,31 +142,34 @@ impl OutboundManager {
                     let tcp = Box::new(redirect::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
+                        bind_addr,
+                        dns_client: dns_client.clone(),
                     });
                     let udp = Box::new(redirect::UdpHandler {
                         address: settings.address,
                         port: settings.port as u16,
+                        bind_addr,
+                        dns_client: dns_client.clone(),
                     });
                     let handler = proxy::outbound::Handler::new(
                         tag.clone(),
                         colored::Color::BrightYellow,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-socks")]
                 "socks" => {
-                    let settings = match protobuf::parse_from_bytes::<config::SocksOutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::SocksOutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
                     let tcp = Box::new(socks::outbound::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
@@ -185,24 +190,23 @@ impl OutboundManager {
                             b: 3,
                         },
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-shadowsocks")]
                 "shadowsocks" => {
-                    let settings = match protobuf::parse_from_bytes::<
-                        config::ShadowsocksOutboundSettings,
-                    >(&outbound.settings)
-                    {
+                    let settings = match config::ShadowsocksOutboundSettings::parse_from_bytes(
+                        &outbound.settings,
+                    ) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!("invalid [{}] outbound settings: {}", &tag, e);
                             continue;
                         }
                     };
-                    let tcp = Box::new(shadowsocks::TcpHandler {
+                    let tcp = Box::new(shadowsocks::outbound::TcpHandler {
                         address: settings.address.clone(),
                         port: settings.port as u16,
                         cipher: settings.method.clone(),
@@ -210,7 +214,7 @@ impl OutboundManager {
                         bind_addr,
                         dns_client: dns_client.clone(),
                     });
-                    let udp = Box::new(shadowsocks::UdpHandler {
+                    let udp = Box::new(shadowsocks::outbound::UdpHandler {
                         address: settings.address,
                         port: settings.port as u16,
                         cipher: settings.method,
@@ -222,14 +226,14 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Blue,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag, handler);
                 }
                 #[cfg(feature = "outbound-trojan")]
                 "trojan" => {
-                    let settings = match protobuf::parse_from_bytes::<config::TrojanOutboundSettings>(
+                    let settings = match config::TrojanOutboundSettings::parse_from_bytes(
                         &outbound.settings,
                     ) {
                         Ok(s) => s,
@@ -256,22 +260,21 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Cyan,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag, handler);
                 }
                 #[cfg(feature = "outbound-vmess")]
                 "vmess" => {
-                    let settings = match protobuf::parse_from_bytes::<config::VMessOutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::VMessOutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
 
                     let tcp = Box::new(vmess::TcpHandler {
                         address: settings.address.clone(),
@@ -293,22 +296,21 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Magenta,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag, handler);
                 }
                 #[cfg(feature = "outbound-vless")]
                 "vless" => {
-                    let settings = match protobuf::parse_from_bytes::<config::VLessOutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::VLessOutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
 
                     let tcp = Box::new(vless::TcpHandler {
                         address: settings.address.clone(),
@@ -328,22 +330,21 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Magenta,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag, handler);
                 }
                 #[cfg(feature = "outbound-tls")]
                 "tls" => {
-                    let settings = match protobuf::parse_from_bytes::<config::TlsOutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::TlsOutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
                     let mut alpns = Vec::new();
                     for alpn in settings.alpn.iter() {
                         alpns.push(alpn.clone());
@@ -352,10 +353,6 @@ impl OutboundManager {
                         server_name: settings.server_name.clone(),
                         alpns: alpns.clone(),
                     });
-                    let udp = Box::new(tls::UdpHandler {
-                        server_name: settings.server_name.clone(),
-                        alpns: alpns.clone(),
-                    });
                     let handler = proxy::outbound::Handler::new(
                         tag.clone(),
                         colored::Color::TrueColor {
@@ -364,17 +361,16 @@ impl OutboundManager {
                             b: 3,
                         },
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        None,
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-ws")]
                 "ws" => {
-                    let settings = match protobuf::parse_from_bytes::<
-                        config::WebSocketOutboundSettings,
-                    >(&outbound.settings)
-                    {
+                    let settings = match config::WebSocketOutboundSettings::parse_from_bytes(
+                        &outbound.settings,
+                    ) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -383,10 +379,8 @@ impl OutboundManager {
                     };
                     let tcp = Box::new(ws::outbound::TcpHandler {
                         path: settings.path.clone(),
+                        headers: settings.headers.clone(),
                         dns_client: dns_client.clone(),
-                    });
-                    let udp = Box::new(ws::outbound::UdpHandler {
-                        path: settings.path.clone(),
                     });
                     let handler = proxy::outbound::Handler::new(
                         tag.clone(),
@@ -396,27 +390,22 @@ impl OutboundManager {
                             b: 3,
                         },
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        None,
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-h2")]
                 "h2" => {
-                    let settings = match protobuf::parse_from_bytes::<config::HTTP2OutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::HTTP2OutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
                     let tcp = Box::new(crate::proxy::h2::TcpHandler {
-                        path: settings.path.clone(),
-                        host: settings.host.clone(),
-                    });
-                    let udp = Box::new(crate::proxy::h2::UdpHandler {
                         path: settings.path.clone(),
                         host: settings.host.clone(),
                     });
@@ -428,22 +417,21 @@ impl OutboundManager {
                             b: 3,
                         },
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        None,
                     );
                     handlers.insert(tag.clone(), handler);
                 }
                 #[cfg(feature = "outbound-stat")]
                 "stat" => {
-                    let settings = match protobuf::parse_from_bytes::<config::StatOutboundSettings>(
-                        &outbound.settings,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("invalid [{}] outbound settings: {}", &tag, e);
-                            continue;
-                        }
-                    };
+                    let settings =
+                        match config::StatOutboundSettings::parse_from_bytes(&outbound.settings) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
                     let tcp = Box::new(stat::TcpHandler::new(
                         settings.address,
                         settings.port as u16,
@@ -453,8 +441,8 @@ impl OutboundManager {
                         tag.clone(),
                         colored::Color::Red,
                         ProxyHandlerType::Endpoint,
-                        tcp,
-                        udp,
+                        Some(tcp),
+                        Some(udp),
                     );
                     handlers.insert(tag.clone(), handler);
                 }
@@ -466,13 +454,24 @@ impl OutboundManager {
         for _i in 0..4 {
             for outbound in outbounds.iter() {
                 let tag = String::from(&outbound.tag);
+                let bind_addr = {
+                    let addr = format!("{}:0", &outbound.bind);
+                    let addr = SocketAddrV4::from_str(&addr).map_err(|e| {
+                        anyhow!(
+                            "invalid bind addr [{}] in outbound {}: {}",
+                            &outbound.bind,
+                            &outbound.tag,
+                            e
+                        )
+                    })?;
+                    SocketAddr::from(addr)
+                };
                 match outbound.protocol.as_str() {
                     #[cfg(feature = "outbound-tryall")]
                     "tryall" => {
-                        let settings = match protobuf::parse_from_bytes::<
-                            config::TryAllOutboundSettings,
-                        >(&outbound.settings)
-                        {
+                        let settings = match config::TryAllOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -504,17 +503,16 @@ impl OutboundManager {
                                 b: 250,
                             },
                             ProxyHandlerType::Ensemble,
-                            tcp,
-                            udp,
+                            Some(tcp),
+                            Some(udp),
                         );
                         handlers.insert(tag.clone(), handler);
                     }
                     #[cfg(feature = "outbound-random")]
                     "random" => {
-                        let settings = match protobuf::parse_from_bytes::<
-                            config::RandomOutboundSettings,
-                        >(&outbound.settings)
-                        {
+                        let settings = match config::RandomOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -542,17 +540,16 @@ impl OutboundManager {
                                 b: 250,
                             },
                             ProxyHandlerType::Ensemble,
-                            tcp,
-                            udp,
+                            Some(tcp),
+                            Some(udp),
                         );
                         handlers.insert(tag.clone(), handler);
                     }
                     #[cfg(feature = "outbound-failover")]
                     "failover" => {
-                        let settings = match protobuf::parse_from_bytes::<
-                            config::FailOverOutboundSettings,
-                        >(&outbound.settings)
-                        {
+                        let settings = match config::FailOverOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -593,17 +590,55 @@ impl OutboundManager {
                                 b: 250,
                             },
                             ProxyHandlerType::Ensemble,
-                            tcp,
-                            udp,
+                            Some(tcp),
+                            Some(udp),
+                        );
+                        handlers.insert(tag.clone(), handler);
+                    }
+                    #[cfg(feature = "outbound-amux")]
+                    "amux" => {
+                        let settings = match config::AMuxOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
+                        let mut actors = Vec::new();
+                        for actor in settings.actors.iter() {
+                            if let Some(a) = handlers.get(actor) {
+                                actors.push(a.clone());
+                            }
+                        }
+                        let tcp = Box::new(amux::outbound::TcpHandler::new(
+                            settings.address.clone(),
+                            settings.port as u16,
+                            actors.clone(),
+                            settings.max_accepts as usize,
+                            settings.concurrency as usize,
+                            bind_addr,
+                            dns_client.clone(),
+                        ));
+                        let handler = proxy::outbound::Handler::new(
+                            tag.clone(),
+                            colored::Color::TrueColor {
+                                r: 226,
+                                g: 103,
+                                b: 245,
+                            },
+                            ProxyHandlerType::Ensemble,
+                            Some(tcp),
+                            None,
                         );
                         handlers.insert(tag.clone(), handler);
                     }
                     #[cfg(feature = "outbound-chain")]
                     "chain" => {
-                        let settings = match protobuf::parse_from_bytes::<
-                            config::ChainOutboundSettings,
-                        >(&outbound.settings)
-                        {
+                        let settings = match config::ChainOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("invalid [{}] outbound settings: {}", &tag, e);
@@ -629,14 +664,51 @@ impl OutboundManager {
                         });
                         let handler = proxy::outbound::Handler::new(
                             tag.clone(),
+                            colored::Color::Blue,
+                            ProxyHandlerType::Ensemble,
+                            Some(tcp),
+                            Some(udp),
+                        );
+                        handlers.insert(tag.clone(), handler);
+                    }
+                    #[cfg(feature = "outbound-retry")]
+                    "retry" => {
+                        let settings = match config::RetryOutboundSettings::parse_from_bytes(
+                            &outbound.settings,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("invalid [{}] outbound settings: {}", &tag, e);
+                                continue;
+                            }
+                        };
+                        let mut actors = Vec::new();
+                        for actor in settings.actors.iter() {
+                            if let Some(a) = handlers.get(actor) {
+                                actors.push(a.clone());
+                            }
+                        }
+                        if actors.is_empty() {
+                            continue;
+                        }
+                        let tcp = Box::new(retry::TcpHandler {
+                            actors: actors.clone(),
+                            attempts: settings.attempts as usize,
+                        });
+                        let udp = Box::new(retry::UdpHandler {
+                            actors,
+                            attempts: settings.attempts as usize,
+                        });
+                        let handler = proxy::outbound::Handler::new(
+                            tag.clone(),
                             colored::Color::TrueColor {
-                                r: 226,
-                                g: 103,
-                                b: 245,
+                                r: 182,
+                                g: 235,
+                                b: 250,
                             },
                             ProxyHandlerType::Ensemble,
-                            tcp,
-                            udp,
+                            Some(tcp),
+                            Some(udp),
                         );
                         handlers.insert(tag.clone(), handler);
                     }
@@ -645,10 +717,10 @@ impl OutboundManager {
             }
         }
 
-        OutboundManager {
+        Ok(OutboundManager {
             handlers,
             default_handler,
-        }
+        })
     }
 
     pub fn add(&mut self, tag: String, handler: Arc<dyn OutboundHandler>) {

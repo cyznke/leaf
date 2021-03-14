@@ -3,16 +3,18 @@ use std::{io, net::SocketAddr};
 
 use async_trait::async_trait;
 use futures::future::select_ok;
+use futures::stream::Stream;
 use futures::TryFutureExt;
 use log::*;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::{
     app::dns_client::DnsClient,
     common::resolver::Resolver,
-    session::{Session, SocksAddr},
+    option,
+    session::{DatagramSource, Session, SocksAddr},
 };
 
 pub mod datagram;
@@ -20,48 +22,49 @@ pub mod inbound;
 pub mod outbound;
 pub mod stream;
 
+#[cfg(any(feature = "inbound-amux", feature = "outbound-amux"))]
+pub mod amux;
+#[cfg(any(feature = "inbound-chain", feature = "outbound-chain"))]
+pub mod chain;
+#[cfg(feature = "outbound-direct")]
+pub mod direct;
+#[cfg(feature = "outbound-drop")]
+pub mod drop;
+#[cfg(feature = "outbound-failover")]
+pub mod failover;
+#[cfg(feature = "outbound-h2")]
+pub mod h2;
 #[cfg(feature = "inbound-http")]
 pub mod http;
+#[cfg(feature = "outbound-random")]
+pub mod random;
+#[cfg(feature = "outbound-redirect")]
+pub mod redirect;
+#[cfg(feature = "outbound-retry")]
+pub mod retry;
+#[cfg(any(feature = "inbound-shadowsocks", feature = "outbound-shadowsocks"))]
+pub mod shadowsocks;
+#[cfg(any(feature = "inbound-socks", feature = "outbound-socks"))]
+pub mod socks;
+#[cfg(feature = "outbound-stat")]
+pub mod stat;
+#[cfg(feature = "outbound-tls")]
+pub mod tls;
+#[cfg(any(feature = "inbound-trojan", feature = "outbound-trojan"))]
+pub mod trojan;
+#[cfg(feature = "outbound-tryall")]
+pub mod tryall;
 #[cfg(all(
     feature = "inbound-tun",
     any(target_os = "ios", target_os = "macos", target_os = "linux")
 ))]
 pub mod tun;
-
-#[cfg(feature = "outbound-direct")]
-pub mod direct;
-#[cfg(feature = "outbound-drop")]
-pub mod drop;
-#[cfg(feature = "outbound-h2")]
-pub mod h2;
-#[cfg(feature = "outbound-redirect")]
-pub mod redirect;
-#[cfg(feature = "outbound-shadowsocks")]
-pub mod shadowsocks;
-#[cfg(any(feature = "inbound-socks", feature = "outbound-socks"))]
-pub mod socks;
-#[cfg(feature = "outbound-tls")]
-pub mod tls;
-#[cfg(any(feature = "inbound-trojan", feature = "outbound-trojan"))]
-pub mod trojan;
 #[cfg(feature = "outbound-vless")]
 pub mod vless;
 #[cfg(feature = "outbound-vmess")]
 pub mod vmess;
 #[cfg(any(feature = "inbound-ws", feature = "outbound-ws"))]
 pub mod ws;
-
-#[cfg(any(feature = "inbound-chain", feature = "outbound-chain"))]
-pub mod chain;
-#[cfg(feature = "outbound-failover")]
-pub mod failover;
-#[cfg(feature = "outbound-random")]
-pub mod random;
-#[cfg(feature = "outbound-tryall")]
-pub mod tryall;
-
-#[cfg(feature = "outbound-stat")]
-pub mod stat;
 
 pub use datagram::{
     SimpleInboundDatagram, SimpleInboundDatagramRecvHalf, SimpleInboundDatagramSendHalf,
@@ -76,7 +79,7 @@ pub enum ProxyHandlerType {
     Ensemble,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum UdpTransportType {
     Stream,
     Packet,
@@ -95,18 +98,23 @@ pub trait HandlerTyped {
     fn handler_type(&self) -> ProxyHandlerType;
 }
 
+// New UDP socket.
+async fn create_udp_socket(bind_addr: &SocketAddr) -> io::Result<UdpSocket> {
+    UdpSocket::bind(bind_addr).await
+}
+
 // A single TCP dial.
 async fn tcp_dial_task(
     dial_addr: SocketAddr,
     bind_addr: &SocketAddr,
-) -> io::Result<Box<dyn ProxyStream>> {
+) -> io::Result<(Box<dyn ProxyStream>, SocketAddr)> {
     let socket = Socket::new(Domain::ipv4(), Type::stream(), None)?;
     socket.bind(&bind_addr.clone().into())?;
     trace!("dialing tcp {}", &dial_addr);
     match TcpStream::connect_std(socket.into_tcp_stream(), &dial_addr).await {
         Ok(stream) => {
             trace!("connected tcp {}", &dial_addr);
-            Ok(Box::new(SimpleProxyStream(stream)))
+            Ok((Box::new(SimpleProxyStream(stream)), dial_addr))
         }
         Err(e) => Err(io::Error::new(
             io::ErrorKind::Other,
@@ -116,13 +124,13 @@ async fn tcp_dial_task(
 }
 
 // Dials a TCP stream.
-async fn dial_tcp_stream(
+pub async fn dial_tcp_stream(
     dns_client: Arc<DnsClient>,
     bind_addr: &SocketAddr,
     address: &str,
     port: &u16,
 ) -> io::Result<Box<dyn ProxyStream>> {
-    let mut resolver = Resolver::new(dns_client, bind_addr, address, port)
+    let mut resolver = Resolver::new(dns_client.clone(), bind_addr, address, port)
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -133,13 +141,11 @@ async fn dial_tcp_stream(
 
     let mut last_err = None;
 
-    // TODO make configurable
-    let dial_concurrency = 3;
     let mut done = false;
 
     while !done {
         let mut tasks = Vec::new();
-        for _ in 0..dial_concurrency {
+        for _ in 0..*option::OUTBOUND_DIAL_CONCURRENCY {
             let dial_addr = match resolver.next() {
                 Some(a) => a,
                 None => {
@@ -152,7 +158,12 @@ async fn dial_tcp_stream(
         }
         if !tasks.is_empty() {
             match select_ok(tasks.into_iter()).await {
-                Ok(v) => return Ok(v.0),
+                Ok(v) => {
+                    #[rustfmt::skip]
+                    dns_client.optimize_cache(address.to_owned(), v.0.1.ip()).await;
+                    #[rustfmt::skip]
+                    return Ok(v.0.0);
+                }
                 Err(e) => {
                     last_err = Some(io::Error::new(
                         io::ErrorKind::Other,
@@ -171,6 +182,30 @@ async fn dial_tcp_stream(
     }))
 }
 
+/// An interface with the ability to dial TCP connections.
+#[async_trait]
+pub trait TcpConnector: Send + Sync + Unpin {
+    /// Dials a TCP connection.
+    async fn dial_tcp_stream(
+        &self,
+        dns_client: Arc<DnsClient>,
+        bind_addr: &SocketAddr,
+        address: &str,
+        port: &u16,
+    ) -> io::Result<Box<dyn ProxyStream>> {
+        dial_tcp_stream(dns_client, bind_addr, address, port).await
+    }
+}
+
+/// An interface with the ability to create UDP sockets.
+#[async_trait]
+pub trait UdpConnector: Send + Sync + Unpin {
+    /// Creates a UDP socket.
+    async fn create_udp_socket(&self, bind_addr: &SocketAddr) -> io::Result<UdpSocket> {
+        create_udp_socket(bind_addr).await
+    }
+}
+
 /// A reliable transport for both inbound and outbound handlers.
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 
@@ -178,11 +213,15 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 pub trait OutboundHandler:
     Tag + Color + HandlerTyped + TcpOutboundHandler + UdpOutboundHandler + Send + Unpin
 {
+    fn has_tcp(&self) -> bool;
+    fn has_udp(&self) -> bool;
 }
 
+#[derive(Debug)]
 pub enum OutboundConnect {
     Proxy(String, u16, SocketAddr),
     Direct(SocketAddr),
+    NoConnect,
 }
 
 /// An outbound handler for outgoing TCP conections.
@@ -202,17 +241,6 @@ pub trait TcpOutboundHandler: Send + Sync + Unpin {
         sess: &'a Session,
         stream: Option<Box<dyn ProxyStream>>,
     ) -> io::Result<Box<dyn ProxyStream>>;
-
-    /// Dials a TCP connection.
-    async fn dial_tcp_stream(
-        &self,
-        dns_client: Arc<DnsClient>,
-        bind_addr: &SocketAddr,
-        address: &str,
-        port: &u16,
-    ) -> io::Result<Box<dyn ProxyStream>> {
-        dial_tcp_stream(dns_client, bind_addr, address, port).await
-    }
 }
 
 /// An unreliable transport for outbound handlers.
@@ -231,7 +259,7 @@ pub trait OutboundDatagram: Send + Unpin {
 pub trait OutboundDatagramRecvHalf: Sync + Send + Unpin {
     /// Receives a message on the socket. On success, returns the number of
     /// bytes read and the origin of the message.
-    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocksAddr)>;
 }
 
 /// The send half.
@@ -241,7 +269,7 @@ pub trait OutboundDatagramSendHalf: Sync + Send + Unpin {
     /// number of bytes sent.
     ///
     /// `dst_addr` is not the proxy server address.
-    async fn send_to(&mut self, buf: &[u8], dst_addr: &SocketAddr) -> io::Result<usize>;
+    async fn send_to(&mut self, buf: &[u8], dst_addr: &SocksAddr) -> io::Result<usize>;
 }
 
 /// An outbound handler for outgoing UDP connections.
@@ -269,17 +297,6 @@ pub trait UdpOutboundHandler: Send + Sync + Unpin {
         sess: &'a Session,
         transport: Option<OutboundTransport>,
     ) -> io::Result<Box<dyn OutboundDatagram>>;
-
-    /// Dials a TCP connection.
-    async fn dial_tcp_stream(
-        &self,
-        dns_client: Arc<DnsClient>,
-        bind_addr: &SocketAddr,
-        address: &str,
-        port: &u16,
-    ) -> io::Result<Box<dyn ProxyStream>> {
-        dial_tcp_stream(dns_client, bind_addr, address, port).await
-    }
 }
 
 /// An outbound transport represents either a reliable or unreliable transport.
@@ -300,16 +317,19 @@ pub trait InboundHandler: Tag + TcpInboundHandler + UdpInboundHandler + Send + U
 pub trait TcpInboundHandler: Send + Sync + Unpin {
     async fn handle_tcp<'a>(
         &'a self,
-        transport: InboundTransport,
+        sess: Session,
+        stream: Box<dyn ProxyStream>,
     ) -> std::io::Result<InboundTransport>;
 }
 
 /// An inbound handler for incoming UDP connections.
 #[async_trait]
 pub trait UdpInboundHandler: Send + Sync + Unpin {
+    // TODO Returns an InboundTransport to support UDP-based reliable transports
+    // such as QUIC.
     async fn handle_udp<'a>(
         &'a self,
-        socket: Option<Box<dyn InboundDatagram>>,
+        socket: Box<dyn InboundDatagram>,
     ) -> io::Result<Box<dyn InboundDatagram>>;
 }
 
@@ -328,7 +348,7 @@ pub trait InboundDatagram: Send + Unpin {
 #[async_trait]
 pub trait InboundDatagramRecvHalf: Sync + Send + Unpin {
     /// Receives a single datagram message on the socket. On success, returns
-    /// the number of bytes read, the source address where this message
+    /// the number of bytes read, the source where this message
     /// originated and the destination this message shall be sent to.
     ///
     /// This should be implemented by a proxy inbound handler, the destination
@@ -337,7 +357,7 @@ pub trait InboundDatagramRecvHalf: Sync + Send + Unpin {
     async fn recv_from(
         &mut self,
         buf: &mut [u8],
-    ) -> io::Result<(usize, SocketAddr, Option<SocksAddr>)>;
+    ) -> io::Result<(usize, DatagramSource, Option<SocksAddr>)>;
 }
 
 /// The send half.
@@ -358,12 +378,24 @@ pub trait InboundDatagramSendHalf: Sync + Send + Unpin {
     ) -> io::Result<usize>;
 }
 
+pub enum SingleInboundTransport {
+    /// The reliable transport.
+    Stream(Box<dyn ProxyStream>, Session),
+    /// The unreliable transport.
+    Datagram(Box<dyn InboundDatagram>),
+    /// None.
+    Empty,
+}
+
+pub type IncomingTransport = Box<dyn Stream<Item = SingleInboundTransport> + Sync + Send + Unpin>;
+
 /// An inbound transport represents either a reliable or unreliable transport.
 pub enum InboundTransport {
     /// The reliable transport.
     Stream(Box<dyn ProxyStream>, Session),
     /// The unreliable transport.
     Datagram(Box<dyn InboundDatagram>),
+    Incoming(IncomingTransport),
     /// None.
     Empty,
 }

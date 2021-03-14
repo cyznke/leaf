@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime;
 
 use crate::{
     app::{
@@ -15,7 +14,7 @@ use crate::{
 };
 
 pub fn create_runners(config: Config) -> Result<Vec<Runner>> {
-    let outbound_manager = OutboundManager::new(&config.outbounds, config.dns.as_ref().unwrap());
+    let outbound_manager = OutboundManager::new(&config.outbounds, config.dns.as_ref().unwrap())?;
     let router = Router::new(&config.routing_rules);
     let dispatcher = Arc::new(Dispatcher::new(outbound_manager, router));
     let nat_manager = Arc::new(NatManager::new(dispatcher.clone()));
@@ -24,19 +23,9 @@ pub fn create_runners(config: Config) -> Result<Vec<Runner>> {
     Ok(runners)
 }
 
-pub fn run_with_config(config: Config) -> Result<()> {
-    let mut rt = runtime::Builder::new()
-        .basic_scheduler()
-        .enable_all()
-        .build()
-        .unwrap();
-    let runners = create_runners(config)?;
-    rt.block_on(futures::future::join_all(runners));
-    Ok(())
-}
-
 pub async fn test_outbound(tag: &str, config: &Config) {
-    let outbound_manager = OutboundManager::new(&config.outbounds, config.dns.as_ref().unwrap());
+    let outbound_manager =
+        OutboundManager::new(&config.outbounds, config.dns.as_ref().unwrap()).unwrap();
     let handler = if let Some(v) = outbound_manager.get(tag) {
         v
     } else {
@@ -44,10 +33,8 @@ pub async fn test_outbound(tag: &str, config: &Config) {
         return;
     };
     let sess = Session {
-        source: "0.0.0.0:0".parse().unwrap(),
-        local_addr: "0.0.0.0:0".parse().unwrap(),
         destination: SocksAddr::Domain("www.google.com".to_string(), 80),
-        inbound_tag: "".to_string(),
+        ..Default::default()
     };
     println!("testing outbound {}", &handler.tag());
     let start = tokio::time::Instant::now();

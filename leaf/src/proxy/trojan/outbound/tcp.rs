@@ -8,7 +8,7 @@ use sha2::{Digest, Sha224};
 
 use crate::{
     app::dns_client::DnsClient,
-    proxy::{BufHeadProxyStream, OutboundConnect, ProxyStream, TcpOutboundHandler},
+    proxy::{BufHeadProxyStream, OutboundConnect, ProxyStream, TcpConnector, TcpOutboundHandler},
     session::{Session, SocksAddrWireType},
 };
 
@@ -19,6 +19,8 @@ pub struct Handler {
     pub bind_addr: SocketAddr,
     pub dns_client: Arc<DnsClient>,
 }
+
+impl TcpConnector for Handler {}
 
 #[async_trait]
 impl TcpOutboundHandler for Handler {
@@ -59,6 +61,7 @@ impl TcpOutboundHandler for Handler {
         sess.destination
             .write_buf(&mut buf, SocksAddrWireType::PortLast)?;
         buf.put_slice(b"\r\n");
+        // FIXME receive-only conns
         Ok(Box::new(BufHeadProxyStream {
             inner: stream,
             head: Some(buf),

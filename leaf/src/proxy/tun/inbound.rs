@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use futures::{sink::SinkExt, stream::StreamExt};
 use log::*;
+use protobuf::Message;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tun::{self, Device, TunPacket};
@@ -11,7 +12,7 @@ use crate::{
     app::dispatcher::Dispatcher,
     app::fake_dns::{FakeDns, FakeDnsMode},
     app::nat_manager::NatManager,
-    config::{Inbound, TUNInboundSettings},
+    config::{Inbound, TunInboundSettings},
     Runner,
 };
 
@@ -24,7 +25,7 @@ pub fn new(
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
 ) -> Result<Runner> {
-    let settings = protobuf::parse_from_bytes::<TUNInboundSettings>(&inbound.settings).unwrap();
+    let settings = TunInboundSettings::parse_from_bytes(&inbound.settings).unwrap();
 
     let cfg = if settings.fd >= 0 {
         let mut cfg = tun::Configuration::default();
@@ -64,10 +65,10 @@ pub fn new(
             "fake DNS run in either include mode or exclude mode"
         ));
     }
-    let (fake_dns_mode, fake_dns_domains) = if !fake_dns_exclude.is_empty() {
-        (FakeDnsMode::Exclude, fake_dns_exclude)
-    } else {
+    let (fake_dns_mode, fake_dns_filters) = if !fake_dns_include.is_empty() {
         (FakeDnsMode::Include, fake_dns_include)
+    } else {
+        (FakeDnsMode::Exclude, fake_dns_exclude)
     };
 
     Ok(Box::pin(async move {
@@ -75,8 +76,8 @@ pub fn new(
 
         let fakedns = Arc::new(TokioMutex::new(FakeDns::new(fake_dns_mode)));
 
-        for domain in fake_dns_domains.into_iter() {
-            fakedns.lock().await.add(domain);
+        for filter in fake_dns_filters.into_iter() {
+            fakedns.lock().await.add_filter(filter);
         }
 
         let stack = NetStack::new(inbound.tag.clone(), dispatcher, nat_manager, fakedns);
