@@ -1,4 +1,3 @@
 pub mod inbound;
-pub mod netstack;
 
-pub static NAME: &str = "tun";
+pub use netstack_lwip as netstack;

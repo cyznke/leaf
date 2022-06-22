@@ -4,12 +4,14 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::Result;
 use cidr::{Cidr, IpCidr};
+use futures::TryFutureExt;
 use log::*;
 use maxminddb::geoip2::Country;
-use memmap::Mmap;
+use memmap2::Mmap;
 
-use crate::config::{self, RoutingRule};
-use crate::session::Session;
+use crate::app::SyncDnsClient;
+use crate::config::{self, Router_Rule};
+use crate::session::{Network, Session, SocksAddr};
 
 pub trait Condition: Send + Sync + Unpin {
     fn apply(&self, sess: &Session) -> bool;
@@ -71,15 +73,17 @@ struct IpCidrMatcher {
 }
 
 impl IpCidrMatcher {
-    fn new(ips: &protobuf::RepeatedField<String>) -> Self {
+    fn new(ips: &mut protobuf::RepeatedField<String>) -> Self {
         let mut cidrs = Vec::new();
-        for ip in ips {
+        for ip in ips.iter_mut() {
+            let ip = std::mem::take(ip);
             match ip.parse::<IpCidr>() {
                 Ok(cidr) => cidrs.push(cidr),
                 Err(err) => {
                     debug!("parsing cidr {} failed: {}", ip, err);
                 }
             }
+            drop(ip);
         }
         IpCidrMatcher { values: cidrs }
     }
@@ -95,6 +99,62 @@ impl Condition for IpCidrMatcher {
                         return true;
                     }
                 }
+            }
+        }
+        false
+    }
+}
+
+struct InboundTagMatcher {
+    values: Vec<String>,
+}
+
+impl InboundTagMatcher {
+    fn new(tags: &mut protobuf::RepeatedField<String>) -> Self {
+        let mut values = Vec::new();
+        for t in tags.iter_mut() {
+            values.push(std::mem::take(t));
+        }
+        Self { values }
+    }
+}
+
+impl Condition for InboundTagMatcher {
+    fn apply(&self, sess: &Session) -> bool {
+        for v in &self.values {
+            if v == &sess.inbound_tag {
+                debug!("[{}] matches inbound tag [{}]", &sess.inbound_tag, v);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+struct NetworkMatcher {
+    values: Vec<Network>,
+}
+
+impl NetworkMatcher {
+    fn new(networks: &mut protobuf::RepeatedField<String>) -> Self {
+        let mut values = Vec::new();
+        for net in networks.iter_mut() {
+            match std::mem::take(net).to_uppercase().as_str() {
+                "TCP" => values.push(Network::Tcp),
+                "UDP" => values.push(Network::Udp),
+                _ => (),
+            }
+        }
+        Self { values }
+    }
+}
+
+impl Condition for NetworkMatcher {
+    fn apply(&self, sess: &Session) -> bool {
+        for v in &self.values {
+            if v == &sess.network {
+                debug!("[{}] matches network [{}]", &sess.network, v);
+                return true;
             }
         }
         false
@@ -227,7 +287,7 @@ impl Condition for DomainSuffixMatcher {
     fn apply(&self, sess: &Session) -> bool {
         if sess.destination.is_domain() {
             if let Some(domain) = sess.destination.domain() {
-                if is_sub_domain(&domain, &self.value) {
+                if is_sub_domain(domain, &self.value) {
                     debug!("[{}] matches domain suffix [{}]", domain, &self.value);
                     return true;
                 }
@@ -266,18 +326,19 @@ struct DomainMatcher {
 }
 
 impl DomainMatcher {
-    fn new(domains: &protobuf::RepeatedField<config::RoutingRule_Domain>) -> Self {
+    fn new(domains: &mut protobuf::RepeatedField<config::Router_Rule_Domain>) -> Self {
         let mut cond_or = ConditionOr::new();
-        for rr_domain in domains.iter() {
+        for rr_domain in domains.iter_mut() {
+            let filter = std::mem::take(&mut rr_domain.value);
             match rr_domain.field_type {
-                config::RoutingRule_Domain_Type::PLAIN => {
-                    cond_or.add(Box::new(DomainKeywordMatcher::new(rr_domain.value.clone())));
+                config::Router_Rule_Domain_Type::PLAIN => {
+                    cond_or.add(Box::new(DomainKeywordMatcher::new(filter)));
                 }
-                config::RoutingRule_Domain_Type::DOMAIN => {
-                    cond_or.add(Box::new(DomainSuffixMatcher::new(rr_domain.value.clone())));
+                config::Router_Rule_Domain_Type::DOMAIN => {
+                    cond_or.add(Box::new(DomainSuffixMatcher::new(filter)));
                 }
-                config::RoutingRule_Domain_Type::FULL => {
-                    cond_or.add(Box::new(DomainFullMatcher::new(rr_domain.value.clone())));
+                config::Router_Rule_Domain_Type::FULL => {
+                    cond_or.add(Box::new(DomainFullMatcher::new(filter)));
                 }
             }
         }
@@ -353,37 +414,39 @@ impl Condition for ConditionOr {
 
 pub struct Router {
     rules: Vec<Rule>,
+    domain_resolve: bool,
+    dns_client: SyncDnsClient,
 }
 
 impl Router {
-    pub fn new(routing_rules: &protobuf::RepeatedField<RoutingRule>) -> Self {
-        let mut rules = Vec::new();
+    fn load_rules(rules: &mut Vec<Rule>, routing_rules: &mut protobuf::RepeatedField<Router_Rule>) {
         let mut mmdb_readers: HashMap<String, Arc<maxminddb::Reader<Mmap>>> = HashMap::new();
-        for rr in routing_rules.iter() {
+        for rr in routing_rules.iter_mut() {
             let mut cond_and = ConditionAnd::new();
 
             if rr.domains.len() > 0 {
-                cond_and.add(Box::new(DomainMatcher::new(&rr.domains)));
+                cond_and.add(Box::new(DomainMatcher::new(&mut rr.domains)));
             }
 
             if rr.ip_cidrs.len() > 0 {
-                cond_and.add(Box::new(IpCidrMatcher::new(&rr.ip_cidrs)));
+                cond_and.add(Box::new(IpCidrMatcher::new(&mut rr.ip_cidrs)));
             }
 
             if rr.mmdbs.len() > 0 {
                 for mmdb in rr.mmdbs.iter() {
                     let reader = match mmdb_readers.get(&mmdb.file) {
                         Some(r) => r.clone(),
-                        None => {
-                            if let Ok(r) = maxminddb::Reader::open_mmap(&mmdb.file) {
+                        None => match maxminddb::Reader::open_mmap(&mmdb.file) {
+                            Ok(r) => {
                                 let r = Arc::new(r);
                                 mmdb_readers.insert((&mmdb.file).to_owned(), r.clone());
                                 r
-                            } else {
-                                warn!("open mmdb file {} failed", mmdb.file);
+                            }
+                            Err(e) => {
+                                warn!("open mmdb file {} failed: {:?}", mmdb.file, e);
                                 continue;
                             }
-                        }
+                        },
                     };
                     cond_and.add(Box::new(MmdbMatcher::new(
                         reader,
@@ -396,20 +459,85 @@ impl Router {
                 cond_and.add(Box::new(PortMatcher::new(&rr.port_ranges)));
             }
 
+            if rr.networks.len() > 0 {
+                cond_and.add(Box::new(NetworkMatcher::new(&mut rr.networks)));
+            }
+
+            if rr.inbound_tags.len() > 0 {
+                cond_and.add(Box::new(InboundTagMatcher::new(&mut rr.inbound_tags)));
+            }
+
             if cond_and.is_empty() {
                 warn!("empty rule at target {}", rr.target_tag);
                 continue;
             }
 
-            rules.push(Rule::new(rr.target_tag.clone(), Box::new(cond_and)));
+            let tag = std::mem::take(&mut rr.target_tag);
+            rules.push(Rule::new(tag, Box::new(cond_and)));
         }
-        Router { rules }
     }
 
-    pub fn pick_route(&self, sess: &Session) -> Result<&String> {
+    pub fn new(
+        router: &mut protobuf::SingularPtrField<config::Router>,
+        dns_client: SyncDnsClient,
+    ) -> Self {
+        let mut rules: Vec<Rule> = Vec::new();
+        let mut domain_resolve = false;
+        if let Some(router) = router.as_mut() {
+            Self::load_rules(&mut rules, &mut router.rules);
+            domain_resolve = router.domain_resolve;
+        }
+        Router {
+            rules,
+            domain_resolve,
+            dns_client,
+        }
+    }
+
+    pub fn reload(
+        &mut self,
+        router: &mut protobuf::SingularPtrField<config::Router>,
+    ) -> Result<()> {
+        self.rules.clear();
+        if let Some(router) = router.as_mut() {
+            Self::load_rules(&mut self.rules, &mut router.rules);
+            self.domain_resolve = router.domain_resolve;
+        }
+        Ok(())
+    }
+
+    pub async fn pick_route<'a>(&'a self, sess: &'a Session) -> Result<&'a String> {
         for rule in &self.rules {
             if rule.apply(sess) {
                 return Ok(&rule.target);
+            }
+        }
+        if sess.destination.is_domain() && self.domain_resolve {
+            let ips = {
+                self.dns_client
+                    .read()
+                    .await
+                    .lookup(
+                        sess.destination
+                            .domain()
+                            .ok_or_else(|| anyhow!("illegal domain name"))?,
+                    )
+                    .map_err(|e| anyhow!("lookup {} failed: {}", sess.destination.host(), e))
+                    .await?
+            };
+            if !ips.is_empty() {
+                let mut new_sess = sess.clone();
+                new_sess.destination = SocksAddr::from((ips[0], sess.destination.port()));
+                log::trace!(
+                    "re-matching with resolved ip [{}] for [{}]",
+                    ips[0],
+                    sess.destination.host()
+                );
+                for rule in &self.rules {
+                    if rule.apply(&new_sess) {
+                        return Ok(&rule.target);
+                    }
+                }
             }
         }
         Err(anyhow!("no matching rules"))

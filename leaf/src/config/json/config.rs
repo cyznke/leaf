@@ -7,12 +7,11 @@ use protobuf::Message;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::config::{external_rule, geosite, internal};
+use crate::config::{external_rule, internal};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Dns {
     pub servers: Option<Vec<String>>,
-    pub bind: Option<String>,
     pub hosts: Option<HashMap<String, Vec<String>>>,
 }
 
@@ -30,7 +29,7 @@ pub struct ShadowsocksInboundSettings {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TrojanInboundSettings {
-    pub password: Option<String>,
+    pub passwords: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,6 +40,20 @@ pub struct WebSocketInboundSettings {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AMuxInboundSettings {
     pub actors: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct QuicInboundSettings {
+    pub certificate: Option<String>,
+    #[serde(rename = "certificateKey")]
+    pub certificate_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TlsInboundSettings {
+    pub certificate: Option<String>,
+    #[serde(rename = "certificateKey")]
+    pub certificate_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -99,21 +112,6 @@ pub struct TrojanOutboundSettings {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct VMessOutboundSettings {
-    pub address: Option<String>,
-    pub port: Option<u16>,
-    pub uuid: Option<String>,
-    pub security: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct VLessOutboundSettings {
-    pub address: Option<String>,
-    pub port: Option<u16>,
-    pub uuid: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 pub struct TryAllOutboundSettings {
     pub actors: Option<Vec<String>>,
     #[serde(rename = "delayBase")]
@@ -121,8 +119,9 @@ pub struct TryAllOutboundSettings {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct RandomOutboundSettings {
+pub struct StaticOutboundSettings {
     pub actors: Option<Vec<String>>,
+    pub method: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -130,18 +129,13 @@ pub struct TlsOutboundSettings {
     #[serde(rename = "serverName")]
     pub server_name: Option<String>,
     pub alpn: Option<Vec<String>>,
+    pub certificate: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WebSocketOutboundSettings {
     pub path: Option<String>,
     pub headers: Option<HashMap<String, String>>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct HTTP2OutboundSettings {
-    pub path: Option<String>,
-    pub host: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -152,6 +146,15 @@ pub struct AMuxOutboundSettings {
     #[serde(rename = "maxAccepts")]
     pub max_accepts: Option<u32>,
     pub concurrency: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct QuicOutboundSettings {
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    #[serde(rename = "serverName")]
+    pub server_name: Option<String>,
+    pub certificate: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -184,16 +187,20 @@ pub struct FailOverOutboundSettings {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct StatOutboundSettings {
-    pub address: Option<String>,
-    pub port: Option<u16>,
+pub struct SelectOutboundSettings {
+    pub actors: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PluginOutboundSettings {
+    pub path: Option<String>,
+    pub args: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Outbound {
     pub protocol: String,
     pub tag: Option<String>,
-    pub bind: Option<String>,
     pub settings: Option<Box<RawValue>>,
 }
 
@@ -209,7 +216,16 @@ pub struct Rule {
     pub external: Option<Vec<String>>,
     #[serde(rename = "portRange")]
     pub port_range: Option<Vec<String>>,
+    #[serde(rename = "inboundTag")]
+    pub inbound_tag: Option<Vec<String>>,
     pub target: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Router {
+    pub rules: Option<Vec<Rule>>,
+    #[serde(rename = "domainResolve")]
+    pub domain_resolve: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -217,14 +233,14 @@ pub struct Config {
     pub log: Option<Log>,
     pub inbounds: Option<Vec<Inbound>>,
     pub outbounds: Option<Vec<Outbound>>,
-    pub rules: Option<Vec<Rule>>,
+    pub router: Option<Router>,
     pub dns: Option<Dns>,
 }
 
-pub fn to_internal(json: Config) -> Result<internal::Config> {
+pub fn to_internal(json: &mut Config) -> Result<internal::Config> {
     let mut log = internal::Log::new();
-    if let Some(ext_log) = json.log {
-        if let Some(ext_level) = ext_log.level {
+    if let Some(ext_log) = &json.log {
+        if let Some(ext_level) = &ext_log.level {
             match ext_level.as_str() {
                 "trace" => log.level = internal::Log_Level::TRACE,
                 "debug" => log.level = internal::Log_Level::DEBUG,
@@ -233,36 +249,29 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 "error" => log.level = internal::Log_Level::ERROR,
                 _ => log.level = internal::Log_Level::WARN,
             }
-        } else {
-            log.level = internal::Log_Level::INFO;
         }
 
-        if let Some(ext_output) = ext_log.output {
+        if let Some(ext_output) = &ext_log.output {
             match ext_output.as_str() {
                 "console" => log.output = internal::Log_Output::CONSOLE,
                 _ => {
                     log.output = internal::Log_Output::FILE;
-                    log.output_file = ext_output;
+                    log.output_file = ext_output.clone();
                 }
             }
-        } else {
-            log.output = internal::Log_Output::CONSOLE;
         }
-    } else {
-        log.level = internal::Log_Level::INFO;
-        log.output = internal::Log_Output::CONSOLE;
     }
 
     let mut inbounds = protobuf::RepeatedField::new();
-    if let Some(ext_inbounds) = json.inbounds {
+    if let Some(ext_inbounds) = &json.inbounds {
         for ext_inbound in ext_inbounds {
             let mut inbound = internal::Inbound::new();
-            inbound.protocol = ext_inbound.protocol;
-            if let Some(ext_tag) = ext_inbound.tag {
-                inbound.tag = ext_tag;
+            inbound.protocol = ext_inbound.protocol.clone();
+            if let Some(ext_tag) = &ext_inbound.tag {
+                inbound.tag = ext_tag.clone();
             }
-            if let Some(ext_address) = ext_inbound.address {
-                inbound.address = ext_address;
+            if let Some(ext_address) = &ext_inbound.address {
+                inbound.address = ext_address.to_owned();
             } else {
                 inbound.address = "127.0.0.1".to_string();
             }
@@ -270,14 +279,19 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 inbound.port = ext_port as u32;
             }
             match inbound.protocol.as_str() {
-                #[cfg(any(target_os = "ios", target_os = "macos", target_os = "linux"))]
+                #[cfg(any(
+                    target_os = "ios",
+                    target_os = "android",
+                    target_os = "macos",
+                    target_os = "linux"
+                ))]
                 "tun" => {
                     if ext_inbound.settings.is_none() {
                         return Err(anyhow!("invalid tun inbound settings"));
                     }
                     let mut settings = internal::TunInboundSettings::new();
                     let ext_settings: TunInboundSettings =
-                        serde_json::from_str(ext_inbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
 
                     let mut fake_dns_exclude = protobuf::RepeatedField::new();
                     if let Some(ext_excludes) = ext_settings.fake_dns_exclude {
@@ -334,7 +348,7 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 "shadowsocks" => {
                     let mut settings = internal::ShadowsocksInboundSettings::new();
                     let ext_settings: ShadowsocksInboundSettings =
-                        serde_json::from_str(ext_inbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
                     if let Some(ext_method) = ext_settings.method {
                         settings.method = ext_method;
                     } else {
@@ -350,11 +364,11 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 "trojan" => {
                     let mut settings = internal::TrojanInboundSettings::new();
                     let ext_settings: TrojanInboundSettings =
-                        serde_json::from_str(ext_inbound.settings.unwrap().get()).unwrap();
-                    if let Some(ext_password) = ext_settings.password {
-                        settings.password = ext_password;
-                    } else {
-                        settings.password = "".to_string(); // FIXME warns?
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
+                    if let Some(ext_passwords) = ext_settings.passwords {
+                        for ext_pass in ext_passwords {
+                            settings.passwords.push(ext_pass);
+                        }
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     inbound.settings = settings;
@@ -363,7 +377,7 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 "ws" => {
                     let mut settings = internal::WebSocketInboundSettings::new();
                     let ext_settings: WebSocketInboundSettings =
-                        serde_json::from_str(ext_inbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
                     match ext_settings.path {
                         Some(ext_path) if !ext_path.is_empty() => {
                             settings.path = ext_path;
@@ -378,7 +392,7 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                 }
                 "amux" => {
                     let mut settings = internal::AMuxInboundSettings::new();
-                    if let Some(ext_settings) = ext_inbound.settings {
+                    if let Some(ext_settings) = &ext_inbound.settings {
                         if let Ok(ext_settings) =
                             serde_json::from_str::<AMuxInboundSettings>(ext_settings.get())
                         {
@@ -393,13 +407,69 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     inbound.settings = settings;
                     inbounds.push(inbound);
                 }
+                "quic" => {
+                    let mut settings = internal::QuicInboundSettings::new();
+                    let ext_settings: QuicInboundSettings =
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
+                    if let Some(ext_certificate) = ext_settings.certificate {
+                        let cert = Path::new(&ext_certificate);
+                        if cert.is_absolute() {
+                            settings.certificate = cert.to_string_lossy().to_string();
+                        } else {
+                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                            let path = asset_loc.join(cert).to_string_lossy().to_string();
+                            settings.certificate = path;
+                        }
+                    }
+                    if let Some(ext_certificate_key) = ext_settings.certificate_key {
+                        let key = Path::new(&ext_certificate_key);
+                        if key.is_absolute() {
+                            settings.certificate_key = key.to_string_lossy().to_string();
+                        } else {
+                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                            let path = asset_loc.join(key).to_string_lossy().to_string();
+                            settings.certificate_key = path;
+                        }
+                    }
+                    let settings = settings.write_to_bytes().unwrap();
+                    inbound.settings = settings;
+                    inbounds.push(inbound);
+                }
+                "tls" => {
+                    let mut settings = internal::TlsInboundSettings::new();
+                    let ext_settings: TlsInboundSettings =
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
+                    if let Some(ext_certificate) = ext_settings.certificate {
+                        let cert = Path::new(&ext_certificate);
+                        if cert.is_absolute() {
+                            settings.certificate = cert.to_string_lossy().to_string();
+                        } else {
+                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                            let path = asset_loc.join(cert).to_string_lossy().to_string();
+                            settings.certificate = path;
+                        }
+                    }
+                    if let Some(ext_certificate_key) = ext_settings.certificate_key {
+                        let key = Path::new(&ext_certificate_key);
+                        if key.is_absolute() {
+                            settings.certificate_key = key.to_string_lossy().to_string();
+                        } else {
+                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                            let path = asset_loc.join(key).to_string_lossy().to_string();
+                            settings.certificate_key = path;
+                        }
+                    }
+                    let settings = settings.write_to_bytes().unwrap();
+                    inbound.settings = settings;
+                    inbounds.push(inbound);
+                }
                 "chain" => {
                     if ext_inbound.settings.is_none() {
                         return Err(anyhow!("invalid chain inbound settings"));
                     }
                     let mut settings = internal::ChainInboundSettings::new();
                     let ext_settings: ChainInboundSettings =
-                        serde_json::from_str(ext_inbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_inbound.settings.as_ref().unwrap().get()).unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
@@ -417,17 +487,12 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
     }
 
     let mut outbounds = protobuf::RepeatedField::new();
-    if let Some(ext_outbounds) = json.outbounds {
-        for ext_outbound in ext_outbounds {
+    if let Some(ext_outbounds) = &json.outbounds {
+        for ext_outbound in ext_outbounds.iter() {
             let mut outbound = internal::Outbound::new();
-            outbound.protocol = ext_outbound.protocol;
-            if let Some(ext_tag) = ext_outbound.tag {
-                outbound.tag = ext_tag;
-            }
-            if let Some(ext_bind) = ext_outbound.bind {
-                outbound.bind = ext_bind;
-            } else {
-                outbound.bind = "0.0.0.0".to_string();
+            outbound.protocol = ext_outbound.protocol.clone();
+            if let Some(ext_tag) = &ext_outbound.tag {
+                outbound.tag = ext_tag.to_owned();
             }
             match outbound.protocol.as_str() {
                 "direct" | "drop" => {
@@ -439,7 +504,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::RedirectOutboundSettings::new();
                     let ext_settings: RedirectOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_address) = ext_settings.address {
                         settings.address = ext_address;
                     }
@@ -456,7 +522,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::SocksOutboundSettings::new();
                     let ext_settings: SocksOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_address) = ext_settings.address {
                         settings.address = ext_address; // TODO checks
                     }
@@ -473,7 +540,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::ShadowsocksOutboundSettings::new();
                     let ext_settings: ShadowsocksOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_address) = ext_settings.address {
                         settings.address = ext_address; // TODO checks
                     }
@@ -498,7 +566,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::TrojanOutboundSettings::new();
                     let ext_settings: TrojanOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_address) = ext_settings.address {
                         settings.address = ext_address; // TODO checks
                     }
@@ -512,56 +581,12 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
-                "vmess" => {
-                    if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid vmess outbound settings"));
-                    }
-                    let mut settings = internal::VMessOutboundSettings::new();
-                    let ext_settings: VMessOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
-                    if let Some(ext_address) = ext_settings.address {
-                        settings.address = ext_address; // TODO checks
-                    }
-                    if let Some(ext_port) = ext_settings.port {
-                        settings.port = ext_port as u32; // TODO checks
-                    }
-                    if let Some(ext_uuid) = ext_settings.uuid {
-                        settings.uuid = ext_uuid;
-                    }
-                    if let Some(ext_security) = ext_settings.security {
-                        settings.security = ext_security;
-                    } else {
-                        settings.security = "chacha20-ietf-poly1305".to_string();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
-                }
-                "vless" => {
-                    if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid vless outbound settings"));
-                    }
-                    let mut settings = internal::VLessOutboundSettings::new();
-                    let ext_settings: VLessOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
-                    if let Some(ext_address) = ext_settings.address {
-                        settings.address = ext_address; // TODO checks
-                    }
-                    if let Some(ext_port) = ext_settings.port {
-                        settings.port = ext_port as u32; // TODO checks
-                    }
-                    if let Some(ext_uuid) = ext_settings.uuid {
-                        settings.uuid = ext_uuid;
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
-                }
                 "tls" => {
                     let mut settings = internal::TlsOutboundSettings::new();
                     if ext_outbound.settings.is_some() {
                         let ext_settings: TlsOutboundSettings =
-                            serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                            serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                                .unwrap();
                         if let Some(ext_server_name) = ext_settings.server_name {
                             settings.server_name = ext_server_name; // TODO checks
                         }
@@ -573,6 +598,16 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                         }
                         if alpns.len() > 0 {
                             settings.alpn = alpns;
+                        }
+                        if let Some(ext_certificate) = ext_settings.certificate {
+                            let cert = Path::new(&ext_certificate);
+                            if cert.is_absolute() {
+                                settings.certificate = cert.to_string_lossy().to_string();
+                            } else {
+                                let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                                let path = asset_loc.join(cert).to_string_lossy().to_string();
+                                settings.certificate = path;
+                            }
                         }
                     }
                     let settings = settings.write_to_bytes().unwrap();
@@ -586,30 +621,13 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::WebSocketOutboundSettings::new();
                     let ext_settings: WebSocketOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_path) = ext_settings.path {
                         settings.path = ext_path; // TODO checks
                     }
                     if let Some(ext_headers) = ext_settings.headers {
                         settings.headers = ext_headers;
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
-                }
-                "h2" | "http2" => {
-                    outbound.protocol = "h2".to_string(); // use h2 anyway
-                    if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid h2 outbound settings"));
-                    }
-                    let mut settings = internal::HTTP2OutboundSettings::new();
-                    let ext_settings: HTTP2OutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
-                    if let Some(ext_path) = ext_settings.path {
-                        settings.path = ext_path; // TODO checks
-                    }
-                    if let Some(ext_host) = ext_settings.host {
-                        settings.host = ext_host; // TODO checks
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -621,7 +639,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::TryAllOutboundSettings::new();
                     let ext_settings: TryAllOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
@@ -636,17 +655,23 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
-                "random" => {
+                "static" => {
                     if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid random outbound settings"));
+                        return Err(anyhow!("invalid static outbound settings"));
                     }
-                    let mut settings = internal::RandomOutboundSettings::new();
-                    let ext_settings: RandomOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                    let mut settings = internal::StaticOutboundSettings::new();
+                    let ext_settings: StaticOutboundSettings =
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
                         }
+                    }
+                    if let Some(ext_method) = &ext_settings.method {
+                        settings.method = ext_method.clone();
+                    } else {
+                        settings.method = "random".to_string();
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -658,7 +683,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::FailOverOutboundSettings::new();
                     let ext_settings: FailOverOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
@@ -709,7 +735,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     }
                     let mut settings = internal::AMuxOutboundSettings::new();
                     let ext_settings: AMuxOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_address) = ext_settings.address {
                         settings.address = ext_address;
                     }
@@ -735,13 +762,44 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
+                "quic" => {
+                    let mut settings = internal::QuicOutboundSettings::new();
+                    if ext_outbound.settings.is_some() {
+                        let ext_settings: QuicOutboundSettings =
+                            serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                                .unwrap();
+                        if let Some(ext_address) = ext_settings.address {
+                            settings.address = ext_address;
+                        }
+                        if let Some(ext_port) = ext_settings.port {
+                            settings.port = ext_port as u32;
+                        }
+                        if let Some(ext_server_name) = ext_settings.server_name {
+                            settings.server_name = ext_server_name;
+                        }
+                        if let Some(ext_certificate) = ext_settings.certificate {
+                            let cert = Path::new(&ext_certificate);
+                            if cert.is_absolute() {
+                                settings.certificate = cert.to_string_lossy().to_string();
+                            } else {
+                                let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                                let path = asset_loc.join(cert).to_string_lossy().to_string();
+                                settings.certificate = path;
+                            }
+                        }
+                    }
+                    let settings = settings.write_to_bytes().unwrap();
+                    outbound.settings = settings;
+                    outbounds.push(outbound);
+                }
                 "chain" => {
                     if ext_outbound.settings.is_none() {
                         return Err(anyhow!("invalid chain outbound settings"));
                     }
                     let mut settings = internal::ChainOutboundSettings::new();
                     let ext_settings: ChainOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
@@ -751,39 +809,36 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
-                "retry" => {
+                "select" => {
                     if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid retry outbound settings"));
+                        return Err(anyhow!("invalid select outbound settings"));
                     }
-                    let mut settings = internal::RetryOutboundSettings::new();
-                    let ext_settings: RetryOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
+                    let mut settings = internal::SelectOutboundSettings::new();
+                    let ext_settings: SelectOutboundSettings =
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
                     if let Some(ext_actors) = ext_settings.actors {
                         for ext_actor in ext_actors {
                             settings.actors.push(ext_actor);
                         }
                     }
-                    if let Some(ext_attempts) = ext_settings.attempts {
-                        settings.attempts = ext_attempts;
-                    } else {
-                        settings.attempts = 2;
-                    }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
                     outbounds.push(outbound);
                 }
-                "stat" => {
+                "plugin" => {
                     if ext_outbound.settings.is_none() {
-                        return Err(anyhow!("invalid stat outbound settings"));
+                        return Err(anyhow!("invalid plugin outbound settings"));
                     }
-                    let mut settings = internal::StatOutboundSettings::new();
-                    let ext_settings: StatOutboundSettings =
-                        serde_json::from_str(ext_outbound.settings.unwrap().get()).unwrap();
-                    if let Some(ext_address) = ext_settings.address {
-                        settings.address = ext_address;
+                    let mut settings = internal::PluginOutboundSettings::new();
+                    let ext_settings: PluginOutboundSettings =
+                        serde_json::from_str(ext_outbound.settings.as_ref().unwrap().get())
+                            .unwrap();
+                    if let Some(ext_path) = ext_settings.path {
+                        settings.path = ext_path; // TODO checks
                     }
-                    if let Some(ext_port) = ext_settings.port {
-                        settings.port = ext_port as u32;
+                    if let Some(ext_args) = ext_settings.args {
+                        settings.args = ext_args; // TODO checks
                     }
                     let settings = settings.write_to_bytes().unwrap();
                     outbound.settings = settings;
@@ -796,92 +851,95 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
         }
     }
 
-    let mut rules = protobuf::RepeatedField::new();
-    if let Some(ext_rules) = json.rules {
-        // a map for caching external site so we need not load a same file multiple times
-        let mut site_group_lists = HashMap::<String, geosite::SiteGroupList>::new();
-
-        for ext_rule in ext_rules {
-            let mut rule = internal::RoutingRule::new();
-            rule.target_tag = ext_rule.target;
-            if let Some(ext_ips) = ext_rule.ip {
-                for ext_ip in ext_ips {
-                    rule.ip_cidrs.push(ext_ip);
+    let mut router = protobuf::SingularPtrField::none();
+    if let Some(ext_router) = json.router.as_mut() {
+        let mut int_router = internal::Router::new();
+        let mut rules = protobuf::RepeatedField::new();
+        if let Some(ext_rules) = ext_router.rules.as_mut() {
+            // a map for caching external site so we need not load a same file multiple times
+            for ext_rule in ext_rules.iter_mut() {
+                let mut rule = internal::Router_Rule::new();
+                let target_tag = std::mem::take(&mut ext_rule.target);
+                rule.target_tag = target_tag;
+                if let Some(ext_ips) = ext_rule.ip.as_mut() {
+                    for ext_ip in ext_ips.drain(0..) {
+                        rule.ip_cidrs.push(ext_ip);
+                    }
                 }
-            }
-            if let Some(ext_domains) = ext_rule.domain {
-                for ext_domain in ext_domains {
-                    let mut domain = internal::RoutingRule_Domain::new();
-                    domain.field_type = internal::RoutingRule_Domain_Type::FULL;
-                    domain.value = ext_domain;
-                    rule.domains.push(domain);
+                if let Some(ext_domains) = ext_rule.domain.as_mut() {
+                    for ext_domain in ext_domains.drain(0..) {
+                        let mut domain = internal::Router_Rule_Domain::new();
+                        domain.field_type = internal::Router_Rule_Domain_Type::FULL;
+                        domain.value = ext_domain;
+                        rule.domains.push(domain);
+                    }
                 }
-            }
-            if let Some(ext_domain_keywords) = ext_rule.domain_keyword {
-                for ext_domain_keyword in ext_domain_keywords {
-                    let mut domain = internal::RoutingRule_Domain::new();
-                    domain.field_type = internal::RoutingRule_Domain_Type::PLAIN;
-                    domain.value = ext_domain_keyword;
-                    rule.domains.push(domain);
+                if let Some(ext_domain_keywords) = ext_rule.domain_keyword.as_mut() {
+                    for ext_domain_keyword in ext_domain_keywords.drain(0..) {
+                        let mut domain = internal::Router_Rule_Domain::new();
+                        domain.field_type = internal::Router_Rule_Domain_Type::PLAIN;
+                        domain.value = ext_domain_keyword;
+                        rule.domains.push(domain);
+                    }
                 }
-            }
-            if let Some(ext_domain_suffixes) = ext_rule.domain_suffix {
-                for ext_domain_suffix in ext_domain_suffixes {
-                    let mut domain = internal::RoutingRule_Domain::new();
-                    domain.field_type = internal::RoutingRule_Domain_Type::DOMAIN;
-                    domain.value = ext_domain_suffix;
-                    rule.domains.push(domain);
+                if let Some(ext_domain_suffixes) = ext_rule.domain_suffix.as_mut() {
+                    for ext_domain_suffix in ext_domain_suffixes.drain(0..) {
+                        let mut domain = internal::Router_Rule_Domain::new();
+                        domain.field_type = internal::Router_Rule_Domain_Type::DOMAIN;
+                        domain.value = ext_domain_suffix;
+                        rule.domains.push(domain);
+                    }
                 }
-            }
-            if let Some(ext_geoips) = ext_rule.geoip {
-                for ext_geoip in ext_geoips {
-                    let mut mmdb = internal::RoutingRule_Mmdb::new();
-                    let mut file = std::env::current_exe().unwrap();
-                    file.pop();
-                    file.push("geo.mmdb");
-                    mmdb.file = file.to_str().unwrap().to_string();
-                    mmdb.country_code = ext_geoip;
-                    rule.mmdbs.push(mmdb)
+                if let Some(ext_geoips) = ext_rule.geoip.as_mut() {
+                    for ext_geoip in ext_geoips.drain(0..) {
+                        let mut mmdb = internal::Router_Rule_Mmdb::new();
+                        let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
+                        mmdb.file = asset_loc.join("geo.mmdb").to_string_lossy().to_string();
+                        mmdb.country_code = ext_geoip;
+                        rule.mmdbs.push(mmdb)
+                    }
                 }
-            }
-            if let Some(ext_externals) = ext_rule.external {
-                for ext_external in ext_externals {
-                    match external_rule::add_external_rule(
-                        &mut rule,
-                        &ext_external,
-                        &mut site_group_lists,
-                    ) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            println!("load external rule failed: {}", e);
+                if let Some(ext_externals) = ext_rule.external.as_mut() {
+                    for ext_external in ext_externals.drain(0..) {
+                        match external_rule::add_external_rule(&mut rule, &ext_external) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                println!("load external rule failed: {}", e);
+                            }
                         }
                     }
                 }
-            }
-            if let Some(ext_port_ranges) = ext_rule.port_range {
-                for ext_port_range in ext_port_ranges {
-                    // FIXME validate
-                    rule.port_ranges.push(ext_port_range);
+                if let Some(ext_port_ranges) = ext_rule.port_range.as_mut() {
+                    for ext_port_range in ext_port_ranges.drain(0..) {
+                        // FIXME validate
+                        rule.port_ranges.push(ext_port_range);
+                    }
                 }
+                if let Some(ext_its) = ext_rule.inbound_tag.as_mut() {
+                    for it in ext_its.drain(0..) {
+                        rule.inbound_tags.push(it);
+                    }
+                }
+                rules.push(rule);
             }
-            rules.push(rule);
         }
-        drop(site_group_lists); // make sure it's released
+        int_router.rules = rules;
+        if let Some(ext_domain_resolve) = ext_router.domain_resolve {
+            int_router.domain_resolve = ext_domain_resolve;
+        }
+        router = protobuf::SingularPtrField::some(int_router);
     }
 
     let mut dns = internal::Dns::new();
     let mut servers = protobuf::RepeatedField::new();
     let mut hosts = HashMap::new();
-    if let Some(ext_dns) = json.dns {
-        if let Some(ext_bind) = ext_dns.bind {
-            dns.bind = ext_bind;
-        }
-        if let Some(ext_servers) = ext_dns.servers {
+    if let Some(ext_dns) = &json.dns {
+        if let Some(ext_servers) = ext_dns.servers.as_ref() {
             for ext_server in ext_servers {
-                servers.push(ext_server);
+                servers.push(ext_server.to_owned());
             }
         }
-        if let Some(ext_hosts) = ext_dns.hosts {
+        if let Some(ext_hosts) = ext_dns.hosts.as_ref() {
             for (name, static_ips) in ext_hosts.iter() {
                 let mut ips = internal::Dns_Ips::new();
                 let mut ip_vals = protobuf::RepeatedField::new();
@@ -893,12 +951,8 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
             }
         }
     }
-    if dns.bind.is_empty() {
-        dns.bind = "0.0.0.0".to_string();
-    }
     if servers.len() == 0 {
-        servers.push("114.114.114.114".to_string());
-        servers.push("8.8.8.8".to_string());
+        servers.push("1.1.1.1".to_string());
     }
     dns.servers = servers;
     if !hosts.is_empty() {
@@ -909,14 +963,18 @@ pub fn to_internal(json: Config) -> Result<internal::Config> {
     config.log = protobuf::SingularPtrField::some(log);
     config.inbounds = inbounds;
     config.outbounds = outbounds;
-    config.routing_rules = rules;
+    config.router = router;
     config.dns = protobuf::SingularPtrField::some(dns);
     Ok(config)
 }
 
-pub fn from_string(config: String) -> Result<Config> {
-    serde_json::from_str(config.as_str())
-        .map_err(|e| anyhow!("deserialize json config failed: {}", e))
+pub fn json_from_string(config: &str) -> Result<Config> {
+    serde_json::from_str(config).map_err(|e| anyhow!("deserialize json config failed: {}", e))
+}
+
+pub fn from_string(s: &str) -> Result<internal::Config> {
+    let mut config = json_from_string(s)?;
+    to_internal(&mut config)
 }
 
 pub fn from_file<P>(path: P) -> Result<internal::Config>
@@ -924,6 +982,6 @@ where
     P: AsRef<Path>,
 {
     let config = std::fs::read_to_string(path)?;
-    let config = from_string(config)?;
-    to_internal(config)
+    let mut config = json_from_string(&config)?;
+    to_internal(&mut config)
 }

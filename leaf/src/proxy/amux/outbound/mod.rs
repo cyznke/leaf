@@ -1,8 +1,7 @@
-mod tcp;
+mod stream;
 
-pub use tcp::Handler as TcpHandler;
+pub use stream::Handler as StreamHandler;
 
 use super::MuxConnector;
 use super::MuxSession;
 use super::MuxStream;
-use super::NAME;

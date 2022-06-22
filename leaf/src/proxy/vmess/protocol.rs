@@ -1,12 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes::Aes128;
+use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
-use cfb_mode::stream_cipher::{NewStreamCipher, StreamCipher};
-use cfb_mode::Cfb;
-use hmac::{Hmac, Mac, NewMac};
+use hmac::{Hmac, Mac};
 use lz_fnv::{Fnv1a, FnvHasher};
 use md5::{Digest, Md5};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -51,10 +49,10 @@ impl RequestHeader {
             Err(_) => return Err(anyhow!("invalid system time")),
         };
         let mut rng = StdRng::from_entropy();
-        let delta: i32 = rng.gen_range(0, 30 * 2) - 30;
+        let delta: i32 = rng.gen_range(0..30 * 2) - 30;
         timestamp = timestamp.wrapping_add(delta as u64);
         let mut mac =
-            Hmac::<Md5>::new_varkey(self.uuid.as_bytes()).map_err(|_| anyhow!("md5 failed"))?;
+            Hmac::<Md5>::new_from_slice(self.uuid.as_bytes()).map_err(|_| anyhow!("md5 failed"))?;
         let mut tmp = [0u8; 8];
         BigEndian::write_u64(&mut tmp, timestamp as u64);
         mac.update(&tmp);
@@ -68,14 +66,14 @@ impl RequestHeader {
         buf.put_u8(sess.response_header);
         buf.put_u8(self.option);
 
-        let padding_len = StdRng::from_entropy().gen_range(0, 16) as u8;
+        let padding_len = StdRng::from_entropy().gen_range(0..16) as u8;
         let security = (padding_len << 4) | self.security as u8;
 
         buf.put_u8(security);
         buf.put_u8(0);
         buf.put_u8(self.command);
 
-        self.address.write_buf(buf, SocksAddrWireType::PortFirst)?;
+        self.address.write_buf(buf, SocksAddrWireType::PortFirst);
 
         // add random bytes
         if padding_len > 0 {
@@ -117,9 +115,7 @@ impl RequestHeader {
         let key = hasher.finalize();
 
         // encrypt cmd part
-        let mut enc =
-            Cfb::<Aes128>::new_var(&key, &iv).map_err(|_| anyhow!("new aes128 enc failed"))?;
-        enc.encrypt(&mut buf[auth_info.len()..]);
+        cfb_mode::Encryptor::<aes::Aes128>::new(&key, &iv).encrypt(&mut buf[auth_info.len()..]);
         Ok(())
     }
 }

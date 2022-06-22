@@ -1,6 +1,6 @@
 mod common;
 
-// app(socks) -> (socks)client(shadowsocks+ws+trojan) -> (shadowsocks)server2(direct) -> (ws+trojan)server1(direct) -> echo
+// app(socks) -> (socks)client(chain(shadowsocks+ws+trojan)) -> (shadowsocks)server2(direct) -> (chain(ws+trojan))server1(direct) -> echo
 #[cfg(all(
     feature = "outbound-socks",
     feature = "inbound-socks",
@@ -11,6 +11,8 @@ mod common;
     feature = "outbound-shadowsocks",
     feature = "inbound-shadowsocks",
     feature = "outbound-direct",
+    feature = "inbound-chain",
+    feature = "outbound-chain",
 ))]
 #[test]
 fn test_out_chain_5() {
@@ -91,7 +93,9 @@ fn test_out_chain_5() {
                 "protocol": "trojan",
                 "tag": "trojan",
                 "settings": {
-                    "password": "password"
+                    "passwords": [
+                        "password"
+                    ]
                 }
             }
         ],

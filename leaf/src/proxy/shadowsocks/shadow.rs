@@ -1,6 +1,6 @@
+use std::mem::MaybeUninit;
 use std::{cmp::min, io, pin::Pin};
 
-use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{
@@ -9,7 +9,7 @@ use futures::{
 };
 use log::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::common::crypto::{
     aead::{AeadCipher, AeadDecryptor, AeadEncryptor},
@@ -46,9 +46,16 @@ pub struct ShadowedStream<T> {
 }
 
 impl<T> ShadowedStream<T> {
-    pub fn new(s: T, cipher: &str, password: &str) -> Result<Self> {
-        let cipher = AeadCipher::new(cipher)?;
-        let psk = kdf(password, cipher.key_len())?;
+    pub fn new(s: T, cipher: &str, password: &str) -> io::Result<Self> {
+        let cipher = AeadCipher::new(cipher).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("create AEAD cipher failed: {}", e),
+            )
+        })?;
+        let psk = kdf(password, cipher.key_len()).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("derive key failed: {}", e))
+        })?;
         Ok(ShadowedStream {
             inner: s,
             cipher,
@@ -56,9 +63,8 @@ impl<T> ShadowedStream<T> {
             enc: None,
             dec: None,
 
-            // never depend on these sizes, reserve when need
-            read_buf: BytesMut::with_capacity(0x3fff + 0x20),
-            write_buf: BytesMut::with_capacity(0x2 + 0x3fff + 0x20 * 2),
+            read_buf: BytesMut::new(),
+            write_buf: BytesMut::new(),
 
             read_state: ReadState::WaitingSalt,
             write_state: WriteState::WaitingSalt,
@@ -71,33 +77,39 @@ trait ReadExt {
     fn poll_read_exact(&mut self, cx: &mut Context, size: usize) -> Poll<io::Result<()>>;
 }
 
+fn early_eof() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "early eof")
+}
+
 impl<T> ReadExt for ShadowedStream<T>
 where
     T: AsyncRead + Unpin,
 {
+    // Read exactly `size` bytes into `read_buf`, starting from position 0.
     fn poll_read_exact(&mut self, cx: &mut Context, size: usize) -> Poll<io::Result<()>> {
         self.read_buf.reserve(size);
-        unsafe { self.read_buf.set_len(size) };
+        unsafe { self.read_buf.set_len(size) }
         loop {
             if self.read_pos < size {
-                let n =
-                    ready!(Pin::new(&mut self.inner)
-                        .poll_read(cx, &mut self.read_buf[self.read_pos..]))?;
-                self.read_pos += n;
-                if n == 0 {
-                    return Err(eof()).into();
+                let dst = unsafe {
+                    &mut *((&mut self.read_buf[self.read_pos..size]) as *mut _
+                        as *mut [MaybeUninit<u8>])
+                };
+                let mut buf = ReadBuf::uninit(dst);
+                let ptr = buf.filled().as_ptr();
+                ready!(Pin::new(&mut self.inner).poll_read(cx, &mut buf))?;
+                assert_eq!(ptr, buf.filled().as_ptr());
+                if buf.filled().is_empty() {
+                    return Poll::Ready(Err(early_eof()));
                 }
-            }
-            if self.read_pos >= size {
+                self.read_pos += buf.filled().len();
+            } else {
+                assert!(self.read_pos == size);
                 self.read_pos = 0;
                 return Poll::Ready(Ok(()));
             }
         }
     }
-}
-
-fn eof() -> io::Error {
-    io::Error::new(io::ErrorKind::UnexpectedEof, "early eof")
 }
 
 pub fn crypto_err() -> io::Error {
@@ -111,8 +123,8 @@ where
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        buf: &mut ReadBuf,
+    ) -> Poll<io::Result<()>> {
         loop {
             match self.read_state {
                 ReadState::WaitingSalt => {
@@ -142,7 +154,13 @@ where
                     // read and decipher payload length
                     let me = &mut *self;
                     let read_size = 2 + me.cipher.tag_len();
-                    ready!(me.poll_read_exact(cx, read_size))?;
+                    if let Err(e) = ready!(me.poll_read_exact(cx, read_size)) {
+                        if e.kind() == io::ErrorKind::UnexpectedEof {
+                            return Poll::Ready(Ok(()));
+                        } else {
+                            return Poll::Ready(Err(e));
+                        }
+                    }
                     let dec = me.dec.as_mut().expect("uninitialized cipher");
                     dec.decrypt(&mut me.read_buf).map_err(|_| crypto_err())?;
                     let payload_len = BigEndian::read_u16(&me.read_buf) as usize;
@@ -162,9 +180,9 @@ where
                     me.read_state = ReadState::PendingData(n);
                 }
                 ReadState::PendingData(n) => {
-                    let to_read = min(buf.len(), n);
+                    let to_read = min(buf.remaining(), n);
                     let payload = self.read_buf.split_to(to_read);
-                    (&mut buf[..to_read]).copy_from_slice(&payload);
+                    buf.put_slice(&payload);
                     if to_read < n {
                         // there're unread data, continues in next poll
                         self.read_state = ReadState::PendingData(n - to_read);
@@ -172,7 +190,7 @@ where
                         // all data consumed, ready to read next chunk
                         self.read_state = ReadState::WaitingLength;
                     }
-                    return Poll::Ready(Ok(to_read));
+                    return Poll::Ready(Ok(()));
                 }
             }
         }
@@ -188,6 +206,7 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        use tokio_util::io::poll_write_buf;
         loop {
             match self.write_state {
                 WriteState::WaitingSalt => {
@@ -224,9 +243,13 @@ where
 
                     // write salt
                     // TODO write salt together with payload
-                    let nw = ready!(Pin::new(&mut me.inner).poll_write_buf(cx, &mut me.write_buf))?;
+                    let nw = ready!(poll_write_buf(
+                        Pin::new(&mut me.inner),
+                        cx,
+                        &mut me.write_buf
+                    ))?;
                     if nw == 0 {
-                        return Err(eof()).into();
+                        return Err(early_eof()).into();
                     }
 
                     if written + nw >= total {
@@ -271,9 +294,13 @@ where
 
                     // There would be trouble if the caller change the buf upon pending, but I
                     // believe that's not a usual use case.
-                    let nw = ready!(Pin::new(&mut me.inner).poll_write_buf(cx, &mut me.write_buf))?;
+                    let nw = ready!(poll_write_buf(
+                        Pin::new(&mut me.inner),
+                        cx,
+                        &mut me.write_buf
+                    ))?;
                     if nw == 0 {
-                        return Err(eof()).into();
+                        return Err(early_eof()).into();
                     }
 
                     if written + nw >= total {
@@ -307,11 +334,16 @@ pub struct ShadowedDatagram {
 }
 
 impl ShadowedDatagram {
-    pub fn new(cipher: &str, password: &str) -> Result<Self> {
-        let cipher =
-            AeadCipher::new(cipher).map_err(|e| anyhow!("new aead cipher failed: {}", e))?;
-        let psk =
-            kdf(password, cipher.key_len()).map_err(|e| anyhow!("derive key failed: {}", e))?;
+    pub fn new(cipher: &str, password: &str) -> io::Result<Self> {
+        let cipher = AeadCipher::new(cipher).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("create AEAD cipher failed: {}", e),
+            )
+        })?;
+        let psk = kdf(password, cipher.key_len()).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("derive key failed: {}", e))
+        })?;
         Ok(ShadowedDatagram { cipher, psk })
     }
 

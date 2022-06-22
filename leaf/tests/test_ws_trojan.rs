@@ -1,6 +1,6 @@
 mod common;
 
-// app(socks) -> (socks)client(ws+trojan) -> (ws+trojan)server(direct) -> echo
+// app(socks) -> (socks)client(chain(ws+trojan)) -> (chain(ws+trojan))server(direct) -> echo
 #[cfg(all(
     feature = "outbound-socks",
     feature = "inbound-socks",
@@ -9,6 +9,8 @@ mod common;
     feature = "inbound-ws",
     feature = "inbound-trojan",
     feature = "outbound-direct",
+    feature = "inbound-chain",
+    feature = "outbound-chain",
 ))]
 #[test]
 fn test_ws_trojan() {
@@ -76,7 +78,9 @@ fn test_ws_trojan() {
                 "protocol": "trojan",
                 "tag": "trojan",
                 "settings": {
-                    "password": "password"
+                    "passwords": [
+                        "password"
+                    ]
                 }
             }
         ],

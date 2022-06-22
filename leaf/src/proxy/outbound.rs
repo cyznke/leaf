@@ -1,52 +1,44 @@
-use std::io::{self, Result};
+use std::io;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
-use crate::session::Session;
-
-use super::{
-    Color, HandlerTyped, OutboundConnect, OutboundDatagram, OutboundHandler, OutboundTransport,
-    ProxyHandlerType, ProxyStream, Tag, TcpOutboundHandler, UdpOutboundHandler, UdpTransportType,
-};
-
-pub static NAME: &str = "handler";
+use super::*;
 
 /// An outbound handler groups a TCP outbound handler and a UDP outbound
 /// handler.
 pub struct Handler {
     tag: String,
     color: colored::Color,
-    handler_type: ProxyHandlerType,
-    tcp_handler: Option<Box<dyn TcpOutboundHandler>>,
-    udp_handler: Option<Box<dyn UdpOutboundHandler>>,
+    stream_handler: Option<AnyOutboundStreamHandler>,
+    datagram_handler: Option<AnyOutboundDatagramHandler>,
 }
 
 impl Handler {
-    pub fn new(
+    pub(self) fn new(
         tag: String,
         color: colored::Color,
-        handler_type: ProxyHandlerType,
-        tcp: Option<Box<dyn TcpOutboundHandler>>,
-        udp: Option<Box<dyn UdpOutboundHandler>>,
+        stream_handler: Option<AnyOutboundStreamHandler>,
+        datagram_handler: Option<AnyOutboundDatagramHandler>,
     ) -> Arc<Self> {
         Arc::new(Handler {
             tag,
             color,
-            handler_type,
-            tcp_handler: tcp,
-            udp_handler: udp,
+            stream_handler,
+            datagram_handler,
         })
     }
 }
 
 impl OutboundHandler for Handler {
-    fn has_tcp(&self) -> bool {
-        self.tcp_handler.is_some()
+    fn stream(&self) -> io::Result<&AnyOutboundStreamHandler> {
+        self.stream_handler
+            .as_ref()
+            .ok_or(io::Error::new(io::ErrorKind::Other, "no tcp handler"))
     }
 
-    fn has_udp(&self) -> bool {
-        self.udp_handler.is_some()
+    fn datagram(&self) -> io::Result<&AnyOutboundDatagramHandler> {
+        self.datagram_handler
+            .as_ref()
+            .ok_or(io::Error::new(io::ErrorKind::Other, "no udp handler"))
     }
 }
 
@@ -62,77 +54,55 @@ impl Color for Handler {
     }
 }
 
-impl HandlerTyped for Handler {
-    fn handler_type(&self) -> ProxyHandlerType {
-        match self.handler_type {
-            ProxyHandlerType::Direct => ProxyHandlerType::Direct,
-            ProxyHandlerType::Endpoint => ProxyHandlerType::Endpoint,
-            ProxyHandlerType::Ensemble => ProxyHandlerType::Ensemble,
+pub struct HandlerBuilder {
+    tag: String,
+    color: colored::Color,
+    stream_handler: Option<AnyOutboundStreamHandler>,
+    datagram_handler: Option<AnyOutboundDatagramHandler>,
+}
+
+impl HandlerBuilder {
+    pub fn new() -> Self {
+        Self {
+            tag: "".to_string(),
+            color: colored::Color::Magenta,
+            stream_handler: None,
+            datagram_handler: None,
         }
+    }
+
+    pub fn tag(mut self, v: String) -> Self {
+        self.tag = v;
+        self
+    }
+
+    pub fn color(mut self, v: colored::Color) -> Self {
+        self.color = v;
+        self
+    }
+
+    pub fn stream_handler(mut self, v: AnyOutboundStreamHandler) -> Self {
+        self.stream_handler.replace(v);
+        self
+    }
+
+    pub fn datagram_handler(mut self, v: AnyOutboundDatagramHandler) -> Self {
+        self.datagram_handler.replace(v);
+        self
+    }
+
+    pub fn build(self) -> AnyOutboundHandler {
+        Handler::new(
+            self.tag,
+            self.color,
+            self.stream_handler,
+            self.datagram_handler,
+        )
     }
 }
 
-#[async_trait]
-impl TcpOutboundHandler for Handler {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn tcp_connect_addr(&self) -> Option<OutboundConnect> {
-        if let Some(handler) = &self.tcp_handler {
-            handler.tcp_connect_addr()
-        } else {
-            None
-        }
-    }
-
-    async fn handle_tcp<'a>(
-        &'a self,
-        sess: &'a Session,
-        stream: Option<Box<dyn ProxyStream>>,
-    ) -> Result<Box<dyn ProxyStream>> {
-        if let Some(handler) = &self.tcp_handler {
-            handler.handle_tcp(sess, stream).await
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, "no TCP handler"))
-        }
-    }
-}
-
-#[async_trait]
-impl UdpOutboundHandler for Handler {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn udp_connect_addr(&self) -> Option<OutboundConnect> {
-        if let Some(handler) = &self.udp_handler {
-            return handler.udp_connect_addr();
-        } else if let Some(handler) = &self.tcp_handler {
-            return handler.tcp_connect_addr();
-        }
-        None
-    }
-
-    fn udp_transport_type(&self) -> UdpTransportType {
-        if let Some(handler) = &self.udp_handler {
-            handler.udp_transport_type()
-        } else {
-            // Currently all handlers has a tcp outbound handler.
-            // FIXME
-            UdpTransportType::Stream
-        }
-    }
-
-    async fn handle_udp<'a>(
-        &'a self,
-        sess: &'a Session,
-        transport: Option<OutboundTransport>,
-    ) -> Result<Box<dyn OutboundDatagram>> {
-        if let Some(handler) = &self.udp_handler {
-            handler.handle_udp(sess, transport).await
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, "no UDP handler"))
-        }
+impl Default for HandlerBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

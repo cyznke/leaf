@@ -1,9 +1,6 @@
-use std::io::Read;
-
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ByteOrder};
-use digest::ExtendableOutputDirty;
-use log::*;
+use digest::{ExtendableOutput, Update, XofReader};
 use md5::{Digest, Md5};
 use sha3::Shake128;
 
@@ -80,15 +77,15 @@ impl NonceSequence for VMessAEADSequence {
 }
 
 pub struct ShakeSizeParser {
-    shake_reader: sha3::Sha3XofReader,
+    shake_reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
     buf: [u8; 2],
 }
 
 impl ShakeSizeParser {
     pub fn new(nonce: &[u8]) -> Self {
-        let mut shake = Shake128::default();
-        digest::Update::update(&mut shake, nonce);
-        let shake_reader = shake.finalize_xof_dirty();
+        let mut hasher = Shake128::default();
+        hasher.update(nonce);
+        let shake_reader = hasher.finalize_xof();
         ShakeSizeParser {
             shake_reader,
             buf: [0, 0],
@@ -100,12 +97,7 @@ impl ShakeSizeParser {
     }
 
     fn next(&mut self) -> u16 {
-        match self.shake_reader.read(&mut self.buf) {
-            Ok(_) => (),
-            Err(e) => {
-                error!("read from shake reader failed: {}", e);
-            }
-        };
+        XofReader::read(&mut self.shake_reader, &mut self.buf);
         BigEndian::read_u16(&self.buf)
     }
 

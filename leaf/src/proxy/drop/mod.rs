@@ -1,7 +1,5 @@
-pub mod tcp;
-pub mod udp;
+pub mod stream;
+pub mod datagram;
 
-pub use tcp::Handler as TcpHandler;
-pub use udp::Handler as UdpHandler;
-
-pub static NAME: &str = "drop";
+pub use stream::Handler as StreamHandler;
+pub use datagram::Handler as DatagramHandler;
