@@ -5,14 +5,14 @@ use std::io::BufReader;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::TryFutureExt;
-use log::*;
+use tracing::trace;
 
 #[cfg(feature = "rustls-tls")]
 use {
     std::sync::Arc,
     tokio_rustls::{
-        rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore, ServerName},
-        webpki, TlsConnector,
+        rustls::{Certificate, ClientConfig, OwnedTrustAnchor, RootCertStore, ServerName},
+        TlsConnector,
     },
 };
 
@@ -25,6 +25,31 @@ use {
 };
 
 use crate::{proxy::*, session::Session};
+
+#[cfg(feature = "rustls-tls")]
+mod dangerous {
+    use std::time::SystemTime;
+    use tokio_rustls::rustls::{
+        client::{ServerCertVerified, ServerCertVerifier},
+        Certificate, Error, ServerName,
+    };
+
+    pub(super) struct NotVerified;
+
+    impl ServerCertVerifier for NotVerified {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: SystemTime,
+        ) -> core::result::Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+}
 
 pub struct Handler {
     server_name: String,
@@ -39,6 +64,7 @@ impl Handler {
         server_name: String,
         alpns: Vec<String>,
         certificate: Option<String>,
+        insecure: bool,
     ) -> Result<Self> {
         #[cfg(feature = "rustls-tls")]
         {
@@ -46,32 +72,28 @@ impl Handler {
             if let Some(cert) = certificate {
                 let mut pem = BufReader::new(File::open(cert)?);
                 let certs = rustls_pemfile::certs(&mut pem)?;
-                let trust_anchors = certs.iter().map(|cert| {
-                    let ta = webpki::TrustAnchor::try_from_cert_der(&cert[..]).unwrap(); // FIXME
-                    OwnedTrustAnchor::from_subject_spki_name_constraints(
-                        ta.subject,
-                        ta.spki,
-                        ta.name_constraints,
-                    )
-                });
-                root_cert_store.add_server_trust_anchors(trust_anchors);
+                for cert in certs.into_iter().map(Certificate) {
+                    root_cert_store.add(&cert)?;
+                }
             } else {
-                root_cert_store.add_server_trust_anchors(
-                    webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+                root_cert_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(
+                    |ta| {
                         OwnedTrustAnchor::from_subject_spki_name_constraints(
                             ta.subject,
                             ta.spki,
                             ta.name_constraints,
                         )
-                    }),
-                );
+                    },
+                ));
             }
-
             let mut config = ClientConfig::builder()
                 .with_safe_defaults()
                 .with_root_certificates(root_cert_store)
                 .with_no_client_auth();
-
+            if insecure {
+                let mut dangerous_config = config.dangerous();
+                dangerous_config.set_certificate_verifier(Arc::new(dangerous::NotVerified));
+            }
             for alpn in alpns {
                 config.alpn_protocols.push(alpn.as_bytes().to_vec());
             }
@@ -96,6 +118,9 @@ impl Handler {
                     .concat();
                 builder.set_alpn_protos(&wire).expect("set alpn failed");
             }
+            if insecure {
+                builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+            }
             let ssl_connector = builder.build();
             Ok(Handler {
                 server_name,
@@ -103,13 +128,6 @@ impl Handler {
             })
         }
     }
-}
-
-fn tls_err<E>(_error: E) -> io::Error
-where
-    E: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    io::Error::new(io::ErrorKind::Other, "tls error")
 }
 
 #[async_trait]
@@ -121,6 +139,7 @@ impl OutboundStreamHandler for Handler {
     async fn handle<'a>(
         &'a self,
         sess: &'a Session,
+        _lhs: Option<&mut AnyStream>,
         stream: Option<AnyStream>,
     ) -> io::Result<AnyStream> {
         // TODO optimize, dont need copy
@@ -129,27 +148,57 @@ impl OutboundStreamHandler for Handler {
         } else {
             sess.destination.host()
         };
-        trace!("wrapping tls with name {}", &name);
         if let Some(stream) = stream {
             #[cfg(feature = "rustls-tls")]
             {
+                trace!("handling TLS {} with rustls", &name);
                 let connector = TlsConnector::from(self.tls_config.clone());
-                let domain = ServerName::try_from(name.as_str())
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
-                let tls_stream = connector.connect(domain, stream).map_err(tls_err).await?;
+                let domain = ServerName::try_from(name.as_str()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid tls server name {}: {}", &name, e),
+                    )
+                })?;
+                let tls_stream = connector
+                    .connect(domain, stream)
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("connect tls failed: {}", e),
+                        )
+                    })
+                    .await?;
                 // FIXME check negotiated alpn
                 Ok(Box::new(tls_stream))
             }
             #[cfg(feature = "openssl-tls")]
             {
-                let mut ssl = Ssl::new(self.ssl_connector.context()).map_err(tls_err)?;
-                ssl.set_hostname(&name).map_err(tls_err)?;
-                let mut stream = SslStream::new(ssl, stream).map_err(tls_err)?;
+                trace!("handling TLS {} with openssl", &name);
+                let mut ssl = Ssl::new(self.ssl_connector.context()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("new ssl failed: {}", e),
+                    )
+                })?;
+                ssl.set_hostname(&name).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("set tls name failed: {}", e),
+                    )
+                })?;
+                let mut stream = SslStream::new(ssl, stream).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("new ssl stream failed: {}", e),
+                    )
+                })?;
                 Pin::new(&mut stream)
                     .connect()
                     .map_err(|e| {
-                        log::trace!("connect tls stream failed: {}", e);
-                        tls_err(e)
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("connect ssl stream failed: {}", e),
+                        )
                     })
                     .await?;
                 Ok(Box::new(stream))

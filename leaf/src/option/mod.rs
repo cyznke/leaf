@@ -97,6 +97,10 @@ lazy_static! {
         get_env_var_or("LOG_NO_COLOR", false)
     };
 
+    pub static ref DOMAIN_SNIFFING: bool = {
+        get_env_var_or("DOMAIN_SNIFFING", false)
+    };
+
     /// Uplink timeout after downlink EOF.
     pub static ref TCP_UPLINK_TIMEOUT: u64 = {
         get_env_var_or("TCP_UPLINK_TIMEOUT", 10)
@@ -112,9 +116,47 @@ lazy_static! {
         get_env_var_or("LINK_BUFFER_SIZE", 2)
     };
 
+    pub static ref NETSTACK_OUTPUT_CHANNEL_SIZE: usize = {
+        get_env_var_or("NETSTACK_OUTPUT_CHANNEL_SIZE", 512)
+    };
+
+    pub static ref NETSTACK_UDP_UPLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("NETSTACK_UDP_UPLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref UDP_UPLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("UDP_UPLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref UDP_DOWNLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("UDP_DOWNLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref QUIC_ACCEPT_CHANNEL_SIZE: usize = {
+        get_env_var_or("QUIC_ACCEPT_CHANNEL_SIZE", 1024)
+    };
+
+    pub static ref AMUX_ACCEPT_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_ACCEPT_CHANNEL_SIZE", 1024)
+    };
+
+    pub static ref AMUX_STREAM_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_STREAM_CHANNEL_SIZE", 16)
+    };
+
+    pub static ref AMUX_FRAME_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_FRAME_CHANNEL_SIZE", 32)
+    };
+
     /// Buffer size for UDP datagrams receiving/sending, in KB.
     pub static ref DATAGRAM_BUFFER_SIZE: usize = {
         get_env_var_or("DATAGRAM_BUFFER_SIZE", 2)
+    };
+
+    /// The timeout for an accepted inbound TCP connection to finish the proxy
+    /// protocol handshake.
+    pub static ref INBOUND_ACCEPT_TIMEOUT: u64 = {
+        get_env_var_or("INBOUND_ACCEPT_TIMEOUT", 60)
     };
 
     pub static ref OUTBOUND_DIAL_TIMEOUT: u64 = {

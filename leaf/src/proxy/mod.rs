@@ -8,17 +8,17 @@ use async_trait::async_trait;
 use futures::future::select_ok;
 use futures::stream::Stream;
 use futures::TryFutureExt;
-use log::*;
 use socket2::SockRef;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
+use tracing::trace;
 
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 #[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
+use std::os::windows::io::{AsRawSocket, AsSocket};
 #[cfg(target_os = "android")]
 use {
     std::os::unix::io::RawFd, tokio::io::AsyncReadExt, tokio::io::AsyncWriteExt,
@@ -48,6 +48,8 @@ pub mod drop;
 pub mod failover;
 #[cfg(feature = "inbound-http")]
 pub mod http;
+#[cfg(feature = "outbound-obfs")]
+pub mod obfs;
 #[cfg(any(feature = "inbound-quic", feature = "outbound-quic"))]
 pub mod quic;
 #[cfg(feature = "outbound-redirect")]
@@ -84,6 +86,7 @@ pub mod ws;
 pub use datagram::{
     SimpleInboundDatagram, SimpleInboundDatagramRecvHalf, SimpleInboundDatagramSendHalf,
     SimpleOutboundDatagram, SimpleOutboundDatagramRecvHalf, SimpleOutboundDatagramSendHalf,
+    StdOutboundDatagram,
 };
 
 #[derive(Error, Debug)]
@@ -108,7 +111,7 @@ pub trait Tag {
 }
 
 pub trait Color {
-    fn color(&self) -> colored::Color;
+    fn color(&self) -> &colored::Color;
 }
 
 #[derive(Debug)]
@@ -119,7 +122,21 @@ pub enum OutboundBind {
 
 #[cfg(target_os = "android")]
 async fn protect_socket(fd: RawFd) -> io::Result<()> {
-    // TODO Warns about empty protect path?
+    if crate::mobile::callback::android::is_protect_socket_callback_set() {
+        let start = std::time::Instant::now();
+        crate::mobile::callback::android::protect_socket(fd).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to protect outbound socket {}: {:?}", fd, e),
+            )
+        })?;
+        trace!(
+            "protected socket {} in {} µs",
+            fd,
+            start.elapsed().as_micros()
+        );
+        return Ok(());
+    }
     if let Some(addr) = &*option::SOCKET_PROTECT_SERVER {
         let mut stream = TcpStream::connect(addr).await?;
         stream.write_i32(fd as i32).await?;
@@ -129,6 +146,7 @@ async fn protect_socket(fd: RawFd) -> io::Result<()> {
                 format!("failed to protect outbound socket {}", fd),
             ));
         }
+        return Ok(());
     }
     if !option::SOCKET_PROTECT_PATH.is_empty() {
         let mut stream = UnixStream::connect(&*option::SOCKET_PROTECT_PATH).await?;
@@ -139,12 +157,13 @@ async fn protect_socket(fd: RawFd) -> io::Result<()> {
                 format!("failed to protect outbound socket {}", fd),
             ));
         }
+        return Ok(());
     }
     Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-trait BindSocket: AsRawFd {
+trait BindSocket: AsFd {
     fn bind(&self, bind_addr: &SocketAddr) -> io::Result<()>;
 }
 
@@ -179,6 +198,7 @@ impl TcpListener {
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, addr) = self.inner.accept().await?;
         apply_socket_opts(&stream)?;
+        stream.set_linger(Some(Duration::ZERO))?;
         Ok((stream, addr))
     }
 }
@@ -211,28 +231,20 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                     }
 
                     let ret = match indicator {
-                        SocketAddr::V4(..) => {
-                            // https://github.com/apple/darwin-xnu/blob/8f02f2a044b9bb1ad951987ef5bab20ec9486310/bsd/netinet/in.h#L484
-                            const IP_BOUND_IF: libc::c_int = 25;
-                            libc::setsockopt(
-                                socket.as_raw_fd(),
-                                libc::IPPROTO_IP,
-                                IP_BOUND_IF,
-                                &ifidx as *const _ as *const libc::c_void,
-                                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                            )
-                        }
-                        SocketAddr::V6(..) => {
-                            // https://github.com/apple/darwin-xnu/blob/8f02f2a044b9bb1ad951987ef5bab20ec9486310/bsd/netinet6/in6.h#L692
-                            const IPV6_BOUND_IF: libc::c_int = 125;
-                            libc::setsockopt(
-                                socket.as_raw_fd(),
-                                libc::IPPROTO_IPV6,
-                                IPV6_BOUND_IF,
-                                &ifidx as *const _ as *const libc::c_void,
-                                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                            )
-                        }
+                        SocketAddr::V4(..) => libc::setsockopt(
+                            socket.as_fd().as_raw_fd(),
+                            libc::IPPROTO_IP,
+                            libc::IP_BOUND_IF,
+                            &ifidx as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                        ),
+                        SocketAddr::V6(..) => libc::setsockopt(
+                            socket.as_fd().as_raw_fd(),
+                            libc::IPPROTO_IPV6,
+                            libc::IPV6_BOUND_IF,
+                            &ifidx as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                        ),
                     };
                     if ret == -1 {
                         last_err = Some(io::Error::last_os_error());
@@ -245,7 +257,7 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                 unsafe {
                     let ifa = CString::new(iface.as_bytes()).unwrap();
                     let ret = libc::setsockopt(
-                        socket.as_raw_fd(),
+                        socket.as_fd().as_raw_fd(),
                         libc::SOL_SOCKET,
                         libc::SO_BINDTODEVICE,
                         ifa.as_ptr() as *const libc::c_void,
@@ -322,12 +334,12 @@ fn apply_socket_opts_internal(s: SockRef) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn apply_socket_opts<S: AsRawFd>(socket: &S) -> io::Result<()> {
+fn apply_socket_opts<S: AsFd>(socket: &S) -> io::Result<()> {
     let sock_ref = SockRef::from(socket);
     apply_socket_opts_internal(sock_ref)
 }
 #[cfg(windows)]
-fn apply_socket_opts<S: AsRawSocket>(socket: &S) -> io::Result<()> {
+fn apply_socket_opts<S: AsSocket>(socket: &S) -> io::Result<()> {
     let sock_ref = SockRef::from(socket);
     apply_socket_opts_internal(sock_ref)
 }
@@ -346,7 +358,7 @@ pub enum DialOrder {
 }
 
 // A single TCP dial.
-async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<(AnyStream, SocketAddr)> {
+async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<DialResult> {
     let socket = match dial_addr {
         SocketAddr::V4(..) => TcpSocket::new_v4()?,
         SocketAddr::V6(..) => TcpSocket::new_v6()?,
@@ -374,7 +386,10 @@ async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<(AnyStream, SocketAd
         &dial_addr,
         elapsed.as_millis()
     );
-    Ok((Box::new(stream), dial_addr))
+    Ok(DialResult {
+        stream: Box::new(stream),
+        addr: dial_addr,
+    })
 }
 
 pub async fn connect_stream_outbound(
@@ -432,6 +447,11 @@ pub async fn connect_datagram_outbound(
     }
 }
 
+struct DialResult {
+    stream: AnyStream,
+    addr: SocketAddr,
+}
+
 // Dials a TCP stream.
 pub async fn new_tcp_stream(
     dns_client: SyncDnsClient,
@@ -467,10 +487,12 @@ pub async fn new_tcp_stream(
         if !tasks.is_empty() {
             match select_ok(tasks.into_iter()).await {
                 Ok(v) => {
-                    #[rustfmt::skip]
-                    dns_client.read().await.optimize_cache(address.to_owned(), v.0.1.ip()).await;
-                    #[rustfmt::skip]
-                    return Ok(v.0.0);
+                    dns_client
+                        .read()
+                        .await
+                        .optimize_cache(address.to_owned(), v.0.addr.ip())
+                        .await;
+                    return Ok(v.0.stream);
                 }
                 Err(e) => {
                     last_err = Some(io::Error::new(
@@ -545,7 +567,12 @@ pub trait OutboundStreamHandler<S = AnyStream>: Send + Sync + Unpin {
 
     /// Handles a session with the given stream. On success, returns a
     /// stream wraps the incoming stream.
-    async fn handle<'a>(&'a self, sess: &'a Session, stream: Option<S>) -> io::Result<S>;
+    async fn handle<'a>(
+        &'a self,
+        sess: &'a Session,
+        lhs: Option<&mut S>,
+        stream: Option<S>,
+    ) -> io::Result<S>;
 }
 
 type AnyOutboundStreamHandler = Box<dyn OutboundStreamHandler>;

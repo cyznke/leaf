@@ -1,14 +1,16 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use futures::stream::StreamExt;
-use log::*;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::channel as tokio_channel;
 use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
+use tokio::time::timeout;
+use tracing::{debug, info, trace, warn};
 
 use crate::app::dispatcher::Dispatcher;
 use crate::app::nat_manager::{NatManager, UdpPacket};
@@ -34,11 +36,17 @@ async fn handle_inbound_datagram(
     // to the socket by the NAT manager. When the NAT manager reads some packets
     // from the right-hand side socket, they would be sent back here through a
     // channel, then we can send them to left-hand side socket.
-    let (l_tx, mut l_rx): (TokioSender<UdpPacket>, TokioReceiver<UdpPacket>) = tokio_channel(100);
+    let (l_tx, mut l_rx): (TokioSender<UdpPacket>, TokioReceiver<UdpPacket>) =
+        tokio_channel(*crate::option::UDP_UPLINK_CHANNEL_SIZE);
 
     tokio::spawn(async move {
         while let Some(pkt) = l_rx.recv().await {
             let dst_addr = pkt.dst_addr.must_ip();
+            trace!(
+                "inbound send UDP packet: dst {}, {} bytes",
+                &dst_addr,
+                pkt.data.len()
+            );
             if let Err(e) = ls.send_to(&pkt.data[..], &pkt.src_addr, &dst_addr).await {
                 debug!("Send datagram failed: {}", e);
                 break;
@@ -61,6 +69,11 @@ async fn handle_inbound_datagram(
                 continue;
             }
             Ok((n, dgram_src, dst_addr)) => {
+                trace!(
+                    "inbound received UDP packet: src {}, {} bytes",
+                    &dgram_src.address,
+                    n
+                );
                 let pkt = UdpPacket::new(
                     (&buf[..n]).to_vec(),
                     SocksAddr::from(dgram_src.address),
@@ -94,8 +107,9 @@ async fn handle_inbound_transport(
         InboundTransport::Incoming(mut incoming) => {
             while let Some(transport) = incoming.next().await {
                 match transport {
-                    BaseInboundTransport::Stream(stream, sess) => {
+                    BaseInboundTransport::Stream(stream, mut sess) => {
                         let dispatcher_cloned = dispatcher.clone();
+                        sess.inbound_tag = handler.tag().clone();
                         tokio::spawn(async move {
                             dispatcher_cloned.dispatch_stream(sess, stream).await
                         });
@@ -137,7 +151,11 @@ async fn handle_inbound_tcp_stream(
         ..Default::default()
     };
     // Transforms the TCP stream into an inbound transport.
-    let transport = handler.stream()?.handle(sess, Box::new(stream)).await?;
+    let transport = timeout(
+        Duration::from_secs(*crate::option::INBOUND_ACCEPT_TIMEOUT),
+        handler.stream()?.handle(sess, Box::new(stream)),
+    )
+    .await??;
     handle_inbound_transport(transport, handler, dispatcher, nat_manager).await;
     Ok(())
 }
@@ -166,7 +184,7 @@ async fn handle_tcp_listen(
             )
             .await
             {
-                log::debug!("handle inbound stream failed: {}", e);
+                debug!("handle inbound stream failed: {}", e);
             }
         });
     }
@@ -217,7 +235,7 @@ impl NetworkInboundListener {
                 )
                 .await
                 {
-                    log::warn!("handler tcp listen failed: {}", e);
+                    warn!("handler tcp listen failed: {}", e);
                 }
             }));
         }
@@ -236,7 +254,7 @@ impl NetworkInboundListener {
                 )
                 .await
                 {
-                    log::warn!("handler udp listen failed: {}", e);
+                    warn!("handler udp listen failed: {}", e);
                 }
             }));
         }

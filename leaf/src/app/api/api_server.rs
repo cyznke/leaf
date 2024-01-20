@@ -4,6 +4,7 @@ use std::iter::FromIterator;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use tracing::info;
 use warp::Filter;
 
 use crate::RuntimeManager;
@@ -251,7 +252,7 @@ mod filters {
     // POST /api/v1/runtime/reload
     pub fn runtime_reload(
         rm: Arc<RuntimeManager>,
-    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         warp::path!("api" / "v1" / "runtime" / "reload")
             .and(warp::post())
             .and(with_runtime_manager(rm))
@@ -261,7 +262,7 @@ mod filters {
     // POST /api/v1/runtime/shutdown
     pub fn runtime_shutdown(
         rm: Arc<RuntimeManager>,
-    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         warp::path!("api" / "v1" / "runtime" / "shutdown")
             .and(warp::post())
             .and(with_runtime_manager(rm))
@@ -272,7 +273,7 @@ mod filters {
     #[cfg(feature = "stat")]
     pub fn stat_html(
         rm: Arc<RuntimeManager>,
-    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         warp::path!("api" / "v1" / "runtime" / "stat" / "html")
             .and(warp::get())
             .and(with_runtime_manager(rm))
@@ -283,7 +284,7 @@ mod filters {
     #[cfg(feature = "stat")]
     pub fn stat_json(
         rm: Arc<RuntimeManager>,
-    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         warp::path!("api" / "v1" / "runtime" / "stat" / "json")
             .and(warp::get())
             .and(with_runtime_manager(rm))
@@ -315,7 +316,7 @@ impl ApiServer {
             .or(filters::stat_html(self.runtime_manager.clone()))
             .or(filters::stat_json(self.runtime_manager.clone()));
 
-        log::info!("api server listening tcp {}", &listen_addr);
+        info!("api server listening tcp {}", &listen_addr);
         Box::pin(warp::serve(routes).bind(listen_addr))
     }
 }
