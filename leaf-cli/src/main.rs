@@ -34,7 +34,6 @@ struct Args {
     config: String,
 
     /// enables auto reloading when config file changes
-    #[cfg(feature = "auto-reload")]
     #[argh(switch)]
     auto_reload: bool,
 
@@ -59,7 +58,7 @@ struct Args {
     test_outbound_timeout: u64,
 
     /// bound interface, explicitly sets the OUTBOUND_INTERFACE environment variable
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[argh(option, short = 'b')]
     boundif: Option<String>,
 
@@ -86,7 +85,7 @@ fn main() {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     if let Some(iface) = args.boundif {
         std::env::set_var("OUTBOUND_INTERFACE", iface);
     }
@@ -123,7 +122,6 @@ fn main() {
     if let Err(e) = leaf::util::run_with_options(
         0,
         args.config,
-        #[cfg(feature = "auto-reload")]
         args.auto_reload,
         !args.single_thread,
         true,

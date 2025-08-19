@@ -97,8 +97,35 @@ lazy_static! {
         get_env_var_or("LOG_NO_COLOR", false)
     };
 
-    pub static ref DOMAIN_SNIFFING: bool = {
-        get_env_var_or("DOMAIN_SNIFFING", false)
+    /// Turn on TLS SNI sniffing, the sniffed SNI would override the original
+    /// destination address, by default the sniffing would perform only on
+    /// connections with destination port 443, set also TLS_DOMAIN_SNIFFING_ALL
+    /// to make the sniffing work on all connections.
+    pub static ref TLS_DOMAIN_SNIFFING: bool = {
+        get_env_var_or_else(
+            "TLS_DOMAIN_SNIFFING",
+            || get_env_var_or("DOMAIN_SNIFFING", false), // deprecated env var
+        )
+    };
+
+    /// Turn on TLS SNI sniffing for all TCP connections, this may slow down the
+    /// connections a little bit, depending on whether the sniff can make an early
+    /// return.
+    pub static ref TLS_DOMAIN_SNIFFING_ALL: bool = {
+        get_env_var_or("TLS_DOMAIN_SNIFFING_ALL", false)
+    };
+
+    /// Turn on HTTP host sniffing, by default only perform on connections with
+    /// destination port 80.
+    pub static ref HTTP_DOMAIN_SNIFFING: bool = {
+        get_env_var_or("HTTP_DOMAIN_SNIFFING", false)
+    };
+
+    /// Turn on HTTP host sniffing for all TCP connections, this may slow down the
+    /// connections a little bit, depending on whether the sniff can make an early
+    /// return.
+    pub static ref HTTP_DOMAIN_SNIFFING_ALL: bool = {
+        get_env_var_or("HTTP_DOMAIN_SNIFFING_ALL", false)
     };
 
     /// Uplink timeout after downlink EOF.
@@ -268,11 +295,11 @@ lazy_static! {
     };
 
     pub static ref DEFAULT_TUN_IPV4_ADDR: String = {
-        get_env_var_or("DEFAULT_TUN_IPV4_ADDR", "240.255.0.2".to_string())
+        get_env_var_or("DEFAULT_TUN_IPV4_ADDR", "192.168.233.2".to_string())
     };
 
     pub static ref DEFAULT_TUN_IPV4_GW: String = {
-        get_env_var_or("DEFAULT_TUN_IPV4_GW", "240.255.0.1".to_string())
+        get_env_var_or("DEFAULT_TUN_IPV4_GW", "192.168.233.1".to_string())
     };
 
     pub static ref DEFAULT_TUN_IPV4_MASK: String = {

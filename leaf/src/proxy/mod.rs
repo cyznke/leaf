@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use futures::future::select_ok;
 use futures::stream::Stream;
 use futures::TryFutureExt;
-use socket2::SockRef;
+use socket2::{Domain, SockRef, Socket, Type};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use tracing::trace;
+use tracing::debug;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsFd, AsRawFd};
@@ -22,7 +22,7 @@ use std::os::windows::io::{AsRawSocket, AsSocket};
 #[cfg(target_os = "android")]
 use {
     std::os::unix::io::RawFd, tokio::io::AsyncReadExt, tokio::io::AsyncWriteExt,
-    tokio::net::UnixStream,
+    tokio::net::UnixStream, tracing::trace,
 };
 
 use crate::{
@@ -68,26 +68,14 @@ pub mod tls;
 pub mod trojan;
 #[cfg(feature = "outbound-tryall")]
 pub mod tryall;
-#[cfg(all(
-    feature = "inbound-tun",
-    any(
-        target_os = "ios",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "linux"
-    )
-))]
+#[cfg(feature = "inbound-tun")]
 pub mod tun;
 #[cfg(feature = "outbound-vmess")]
 pub mod vmess;
 #[cfg(any(feature = "inbound-ws", feature = "outbound-ws"))]
 pub mod ws;
 
-pub use datagram::{
-    SimpleInboundDatagram, SimpleInboundDatagramRecvHalf, SimpleInboundDatagramSendHalf,
-    SimpleOutboundDatagram, SimpleOutboundDatagramRecvHalf, SimpleOutboundDatagramSendHalf,
-    StdOutboundDatagram,
-};
+pub use datagram::*;
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -207,12 +195,12 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
     match indicator.ip() {
         IpAddr::V4(v4) if v4.is_loopback() => {
             socket.bind(&SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0).into())?;
-            trace!("socket bind loopback v4");
+            debug!("socket bind loopback v4");
             return Ok(());
         }
         IpAddr::V6(v6) if v6.is_loopback() => {
             socket.bind(&SocketAddrV6::new("::1".parse().unwrap(), 0, 0, 0).into())?;
-            trace!("socket bind loopback v6");
+            debug!("socket bind loopback v6");
             return Ok(());
         }
         _ => {}
@@ -250,7 +238,7 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                         last_err = Some(io::Error::last_os_error());
                         continue;
                     }
-                    trace!("socket bind {}", iface);
+                    debug!("socket bind {}", iface);
                     return Ok(());
                 }
                 #[cfg(target_os = "linux")]
@@ -267,7 +255,7 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                         last_err = Some(io::Error::last_os_error());
                         continue;
                     }
-                    trace!("socket bind {}", iface);
+                    debug!("socket bind {}", iface);
                     return Ok(());
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -286,7 +274,7 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                         last_err = Some(e);
                         continue;
                     }
-                    trace!("socket bind {}", addr);
+                    debug!("socket bind {}", addr);
                     return Ok(());
                 }
             }
@@ -302,26 +290,14 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
 
 // New UDP socket.
 pub async fn new_udp_socket(indicator: &SocketAddr) -> io::Result<UdpSocket> {
-    use socket2::{Domain, Socket, Type};
-    let socket = if *option::ENABLE_IPV6 {
-        // Dual-stack socket.
-        // FIXME Windows IPV6_V6ONLY?
-        Socket::new(Domain::IPV6, Type::DGRAM, None)?
-    } else {
-        match indicator {
-            SocketAddr::V4(..) => Socket::new(Domain::IPV4, Type::DGRAM, None)?,
-            SocketAddr::V6(..) => Socket::new(Domain::IPV6, Type::DGRAM, None)?,
-        }
+    let socket = match indicator {
+        SocketAddr::V4(..) => Socket::new(Domain::IPV4, Type::DGRAM, None)?,
+        SocketAddr::V6(..) => Socket::new(Domain::IPV6, Type::DGRAM, None)?,
     };
+
     socket.set_nonblocking(true)?;
 
-    // If the proxy request is coming from an inbound listens on the loopback,
-    // the indicator could be a loopback address, we must ignore it.
-    if indicator.ip().is_loopback() || *option::ENABLE_IPV6 {
-        bind_socket(&socket, &*option::UNSPECIFIED_BIND_ADDR).await?;
-    } else {
-        bind_socket(&socket, indicator).await?;
-    }
+    bind_socket(&socket, indicator).await?;
 
     #[cfg(target_os = "android")]
     protect_socket(socket.as_raw_fd()).await?;
@@ -369,7 +345,7 @@ async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<DialResult> {
     #[cfg(target_os = "android")]
     protect_socket(socket.as_raw_fd()).await?;
 
-    trace!("tcp dialing {}", &dial_addr);
+    debug!("tcp dialing {}", &dial_addr);
     let start = tokio::time::Instant::now();
     let stream = timeout(
         Duration::from_secs(*option::OUTBOUND_DIAL_TIMEOUT),
@@ -380,7 +356,7 @@ async fn tcp_dial_task(dial_addr: SocketAddr) -> io::Result<DialResult> {
 
     apply_socket_opts(&stream)?;
 
-    trace!(
+    debug!(
         "tcp {} <-> {} connected in {}ms",
         stream.local_addr()?,
         &dial_addr,
@@ -421,9 +397,12 @@ pub async fn connect_datagram_outbound(
     match handler.datagram()?.connect_addr() {
         OutboundConnect::Proxy(network, addr, port) => match network {
             Network::Udp => {
-                let socket = new_udp_socket(&sess.source).await?;
+                let socket = match addr.parse::<IpAddr>() {
+                    Ok(ip) if ip.is_loopback() => new_udp_socket(&SocketAddr::new(ip, 0)).await?,
+                    _ => new_udp_socket(&crate::option::UNSPECIFIED_BIND_ADDR).await?,
+                };
                 Ok(Some(OutboundTransport::Datagram(Box::new(
-                    SimpleOutboundDatagram::new(socket, None, dns_client.clone()),
+                    DomainResolveOutboundDatagram::new(socket, dns_client.clone()),
                 ))))
             }
             Network::Tcp => {
@@ -431,18 +410,25 @@ pub async fn connect_datagram_outbound(
                 Ok(Some(OutboundTransport::Stream(stream)))
             }
         },
-        OutboundConnect::Direct => {
-            let socket = new_udp_socket(&sess.source).await?;
-            let dest = match &sess.destination {
-                SocksAddr::Domain(domain, port) => {
-                    Some(SocksAddr::Domain(domain.to_owned(), port.to_owned()))
-                }
-                _ => None,
-            };
-            Ok(Some(OutboundTransport::Datagram(Box::new(
-                SimpleOutboundDatagram::new(socket, dest, dns_client.clone()),
-            ))))
-        }
+        OutboundConnect::Direct => match &sess.destination {
+            SocksAddr::Domain(domain, port) => {
+                let socket = new_udp_socket(&crate::option::UNSPECIFIED_BIND_ADDR).await?;
+                Ok(Some(OutboundTransport::Datagram(Box::new(
+                    DomainAssociatedOutboundDatagram::new(
+                        socket,
+                        sess.source,
+                        SocksAddr::Domain(domain.to_owned(), port.to_owned()),
+                        dns_client.clone(),
+                    ),
+                ))))
+            }
+            SocksAddr::Ip(addr) => {
+                let socket = new_udp_socket(addr).await?;
+                Ok(Some(OutboundTransport::Datagram(Box::new(
+                    StdOutboundDatagram::new(socket),
+                ))))
+            }
+        },
         _ => Ok(None),
     }
 }

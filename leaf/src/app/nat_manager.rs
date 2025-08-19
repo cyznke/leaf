@@ -83,10 +83,9 @@ impl NatManager {
                 let n_removed = n_total - n_remaining;
                 drop(sessions); // release the lock
                 if n_removed > 0 {
-                    trace!(
+                    debug!(
                         "removed {} nat sessions, remaining {} sessions",
-                        n_removed,
-                        n_remaining
+                        n_removed, n_remaining
                     );
                 }
                 tokio::time::sleep(Duration::from_secs(
@@ -103,12 +102,7 @@ impl NatManager {
         }
     }
 
-    fn _send<'a>(
-        &self,
-        guard: &mut MutexGuard<'a, SessionMap>,
-        key: &DatagramSource,
-        pkt: UdpPacket,
-    ) {
+    fn _send(&self, guard: &mut MutexGuard<'_, SessionMap>, key: &DatagramSource, pkt: UdpPacket) {
         if let Some(sess) = guard.get_mut(key) {
             if let Err(err) = sess.0.try_send(pkt) {
                 trace!("send uplink packet failed {}", err);
@@ -145,7 +139,7 @@ impl NatManager {
             sess.inbound_tag = inbound_tag.to_string();
         }
 
-        self.add_session(sess, dgram_src.clone(), client_ch_tx.clone(), &mut guard)
+        self.add_session(sess, *dgram_src, client_ch_tx.clone(), &mut guard)
             .await;
 
         debug!(
@@ -212,7 +206,7 @@ impl NatManager {
                         Ok((n, addr)) => {
                             trace!("outbound received UDP packet: src {}, {} bytes", &addr, n);
                             let pkt = UdpPacket::new(
-                                (&buf[..n]).to_vec(),
+                                buf[..n].to_vec(),
                                 addr.clone(),
                                 SocksAddr::from(raddr.address),
                             );

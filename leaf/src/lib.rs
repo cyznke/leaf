@@ -41,6 +41,10 @@ pub mod mobile;
 #[cfg(all(feature = "inbound-tun", any(target_os = "macos", target_os = "linux")))]
 mod sys;
 
+
+#[cfg(all(feature = "inbound-tun", target_os = "windows"))]
+mod winsys;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
@@ -450,15 +454,12 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         }
     }
 
-    #[cfg(all(
-        feature = "inbound-tun",
-        any(
-            target_os = "ios",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "linux"
-        )
-    ))]
+    #[cfg(all(feature = "inbound-tun", target_os = "windows"))]
+    {
+        std::env::set_var("OUTBOUND_INTERFACE", winsys::get_default_interface_ips());
+    }
+
+    #[cfg(feature = "inbound-tun")]
     if let Ok(r) = inbound_manager.get_tun_runner() {
         runners.push(r);
     }
@@ -497,9 +498,9 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
     #[cfg(feature = "api")]
     {
         use std::net::SocketAddr;
-        let listen_addr = if !(&*option::API_LISTEN).is_empty() {
+        let listen_addr = if !option::API_LISTEN.is_empty() {
             Some(
-                (&*option::API_LISTEN)
+                option::API_LISTEN
                     .parse::<SocketAddr>()
                     .map_err(|e| Error::Config(anyhow!("parse SocketAddr failed: {}", e)))?,
             )

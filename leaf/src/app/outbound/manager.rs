@@ -79,7 +79,7 @@ struct HandlerCacheEntry<'a> {
 impl OutboundManager {
     #[allow(clippy::type_complexity)]
     fn load_handlers(
-        outbounds: &Vec<Outbound>,
+        outbounds: &[Outbound],
         dns_client: SyncDnsClient,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
@@ -103,7 +103,7 @@ impl OutboundManager {
 
             // Check whether an identical one already exist.
             for e in cached_handlers.iter() {
-                if e.protocol == &outbound.protocol && e.settings == &outbound.settings {
+                if e.protocol == outbound.protocol && e.settings == &outbound.settings {
                     trace!("add handler [{}] cloned from [{}]", &tag, &e.tag);
                     handlers.insert(tag.clone(), e.handler.clone());
                     continue 'loop1;
@@ -439,15 +439,12 @@ impl OutboundManager {
                         if actors.is_empty() {
                             continue;
                         }
-                        let last_resort = if settings.last_resort.is_empty() {
-                            None
-                        } else {
-                            if let Some(a) = handlers.get(&settings.last_resort) {
-                                Some(a.clone())
+                        let last_resort =
+                            if let Some(last_resort_tag) = settings.last_resort.as_ref() {
+                                handlers.get(last_resort_tag).cloned()
                             } else {
-                                continue 'outbounds;
-                            }
-                        };
+                                None
+                            };
                         let (stream, mut stream_abort_handles) = failover::StreamHandler::new(
                             actors.clone(),
                             settings.fail_timeout,
@@ -461,6 +458,11 @@ impl OutboundManager {
                             settings.health_check_timeout,
                             settings.health_check_delay,
                             settings.health_check_active,
+                            settings.health_check_prefers.clone(),
+                            settings.health_check_on_start,
+                            settings.health_check_wait,
+                            settings.health_check_attempts,
+                            settings.health_check_success_percentage,
                             dns_client.clone(),
                         );
                         let (datagram, mut datagram_abort_handles) = failover::DatagramHandler::new(
@@ -473,6 +475,11 @@ impl OutboundManager {
                             settings.health_check_timeout,
                             settings.health_check_delay,
                             settings.health_check_active,
+                            settings.health_check_prefers,
+                            settings.health_check_on_start,
+                            settings.health_check_wait,
+                            settings.health_check_attempts,
+                            settings.health_check_success_percentage,
                             dns_client.clone(),
                         );
                         let handler = HandlerBuilder::default()
@@ -599,7 +606,7 @@ impl OutboundManager {
 
     #[allow(unused_variables)]
     fn load_selectors(
-        outbounds: &Vec<Outbound>,
+        outbounds: &[Outbound],
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
 
@@ -690,7 +697,7 @@ impl OutboundManager {
     // TODO make this non-async?
     pub async fn reload(
         &mut self,
-        outbounds: &Vec<Outbound>,
+        outbounds: &[Outbound],
         dns_client: SyncDnsClient,
     ) -> Result<()> {
         // Save outound select states.
@@ -766,7 +773,7 @@ impl OutboundManager {
         Ok(())
     }
 
-    pub fn new(outbounds: &Vec<Outbound>, dns_client: SyncDnsClient) -> Result<Self> {
+    pub fn new(outbounds: &[Outbound], dns_client: SyncDnsClient) -> Result<Self> {
         let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
         #[cfg(feature = "plugin")]
         let mut external_handlers = super::plugin::ExternalHandlers::new();
@@ -814,7 +821,7 @@ impl OutboundManager {
     }
 
     pub fn default_handler(&self) -> Option<String> {
-        self.default_handler.as_ref().map(Clone::clone)
+        self.default_handler.clone()
     }
 
     pub fn handlers(&self) -> Handlers {

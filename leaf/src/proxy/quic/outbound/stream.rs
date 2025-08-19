@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::TryFutureExt;
 use rustls::OwnedTrustAnchor;
+use rustls_pemfile_old::certs;
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 
@@ -38,16 +39,15 @@ impl Manager {
             match fs::read(cert_path) {
                 Ok(cert) => {
                     match Path::new(&cert_path).extension().map(|ext| ext.to_str()) {
-                        Some(Some(ext)) if ext == "der" => {
+                        Some(Some("der")) => {
                             roots.add(&rustls::Certificate(cert)).unwrap(); // FIXME
                         }
                         _ => {
-                            let certs: Vec<rustls::Certificate> =
-                                rustls_pemfile::certs(&mut &*cert)
-                                    .unwrap()
-                                    .into_iter()
-                                    .map(rustls::Certificate)
-                                    .collect();
+                            let certs: Vec<rustls::Certificate> = certs(&mut &*cert)
+                                .unwrap()
+                                .into_iter()
+                                .map(rustls::Certificate)
+                                .collect();
                             for cert in certs {
                                 roots.add(&cert).unwrap();
                             }
@@ -59,7 +59,7 @@ impl Manager {
                 }
             }
         } else {
-            roots.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            roots.add_trust_anchors(webpki_roots_old::TLS_SERVER_ROOTS.iter().map(|ta| {
                 OwnedTrustAnchor::from_subject_spki_name_constraints(
                     ta.subject,
                     ta.spki,
@@ -120,7 +120,7 @@ impl Manager {
 
         // FIXME A better indicator.
         let socket = self
-            .new_udp_socket(&*crate::option::UNSPECIFIED_BIND_ADDR)
+            .new_udp_socket(&crate::option::UNSPECIFIED_BIND_ADDR)
             .await?;
         let mut endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),

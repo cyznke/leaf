@@ -13,7 +13,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -25,14 +25,12 @@ jobs:
       - name: test leaf
         run: cargo test -p leaf
 
-  build-bin-cross:
+  build-cli-cross:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - mips-unknown-linux-musl
-          - mipsel-unknown-linux-musl
           - x86_64-unknown-linux-musl
           - i686-unknown-linux-musl
           - aarch64-unknown-linux-musl
@@ -41,7 +39,7 @@ jobs:
           - x86_64-pc-windows-gnu
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -62,7 +60,7 @@ jobs:
         run: |
           export CFG_COMMIT_HASH=`git log --pretty=format:'%h' -n 1`
           export CFG_COMMIT_DATE=`git log --format="%ci" -n 1`
-          ./scripts/build_cross.sh ${{ matrix.target }}
+          cross build --release --target ${{ matrix.target }}
 
       - name: rename and compress artifacts
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
@@ -76,29 +74,29 @@ jobs:
 
       - name: upload assets
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}.exe
           path: leaf-${{ matrix.target }}.exe
 
       - name: upload assets
         if: ${{ matrix.target != 'x86_64-pc-windows-gnu' }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}
           path: leaf-${{ matrix.target }}
 
-  build-bin-local:
+  build-cli-macos:
+    runs-on: [macos-latest]
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest]
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -116,27 +114,31 @@ jobs:
         run: |
           brew install llvm protobuf
 
+      - name: install target
+        run: |
+          rustup target add ${{ matrix.target }}
+
       - name: build
         run: |
           export CFG_COMMIT_HASH=`git log --pretty=format:'%h' -n 1`
           export CFG_COMMIT_DATE=`git log --format="%ci" -n 1`
-          cargo build --release --target ${{ matrix.target }} -p leaf-bin
+          cargo build --release --target ${{ matrix.target }} -p leaf-cli
 
       - name: rename and compress artifacts
         run: |
           mv target/${{ matrix.target }}/release/leaf leaf-${{ matrix.target }}
 
       - name: upload assets
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}
           path: leaf-${{ matrix.target }}
 
-  build-apple:
+  build-lib-apple:
     runs-on: macos-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -160,16 +162,16 @@ jobs:
           zip -r leaf.xcframework.zip leaf.xcframework
 
       - name: upload assets
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf.xcframework.zip
           path: leaf.xcframework.zip
 
-  build-android:
+  build-lib-android:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -205,7 +207,7 @@ jobs:
           zip -r leaf-android-libs.zip leaf-android-libs
 
       - name: upload assets
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-android-libs.zip
           path: leaf-android-libs.zip

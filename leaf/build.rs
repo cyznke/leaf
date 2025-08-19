@@ -32,7 +32,7 @@ fn generate_mobile_bindings() {
         } else {
             "".to_string()
         })
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
 
@@ -52,8 +52,8 @@ fn main() {
         // println!("cargo:rerun-if-changed=src/config/internal/config.proto");
         protobuf_codegen::Codegen::new()
             .out_dir("src/config/internal")
-            .includes(&["src/config/internal"])
-            .inputs(&["src/config/internal/config.proto"])
+            .includes(["src/config/internal"])
+            .inputs(["src/config/internal/config.proto"])
             .customize(
                 protobuf_codegen::Customize::default()
                     .generate_accessors(false)
@@ -66,8 +66,8 @@ fn main() {
         // println!("cargo:rerun-if-changed=src/config/geosite.proto");
         protobuf_codegen::Codegen::new()
             .out_dir("src/config")
-            .includes(&["src/config"])
-            .inputs(&["src/config/geosite.proto"])
+            .includes(["src/config"])
+            .inputs(["src/config/geosite.proto"])
             .customize(
                 protobuf_codegen::Customize::default()
                     .generate_accessors(false)
@@ -79,8 +79,8 @@ fn main() {
 
         protobuf_codegen::Codegen::new()
             .out_dir("src/app/outbound")
-            .includes(&["src/app/outbound"])
-            .inputs(&["src/app/outbound/selector_cache.proto"])
+            .includes(["src/app/outbound"])
+            .inputs(["src/app/outbound/selector_cache.proto"])
             .customize(
                 protobuf_codegen::Customize::default()
                     .generate_accessors(false)

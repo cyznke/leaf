@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -7,7 +8,6 @@ use protobuf::Message;
 use tokio::sync::mpsc::channel as tokio_channel;
 use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
 use tracing::{debug, error, info, trace, warn};
-use tun::{self, TunPacket};
 
 use crate::{
     app::dispatcher::Dispatcher,
@@ -23,7 +23,7 @@ use crate::{
 use super::netstack;
 
 async fn handle_inbound_stream(
-    stream: netstack::TcpStream,
+    stream: Pin<Box<netstack::TcpStream>>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     inbound_tag: String,
@@ -33,9 +33,9 @@ async fn handle_inbound_stream(
     let mut sess = Session {
         network: Network::Tcp,
         source: local_addr,
-        local_addr: remote_addr.clone(),
-        destination: SocksAddr::Ip(remote_addr.clone()),
-        inbound_tag: inbound_tag,
+        local_addr: remote_addr,
+        destination: SocksAddr::Ip(remote_addr),
+        inbound_tag,
         ..Default::default()
     };
     // Whether to override the destination according to Fake DNS.
@@ -61,7 +61,7 @@ async fn handle_inbound_stream(
 }
 
 async fn handle_inbound_datagram(
-    socket: Box<netstack::UdpSocket>,
+    socket: Pin<Box<netstack::UdpSocket>>,
     inbound_tag: String,
     nat_manager: Arc<NatManager>,
     fakedns: Arc<FakeDns>,
@@ -93,7 +93,7 @@ async fn handle_inbound_datagram(
                     }
                 }
             };
-            if let Err(e) = ls_cloned.send_to(&pkt.data[..], &src_addr, &pkt.dst_addr.must_ip()) {
+            if let Err(e) = ls_cloned.send_to(&pkt.data[..], &src_addr, pkt.dst_addr.must_ip()) {
                 warn!("A packet failed to send to the netstack: {}", e);
             }
         }
@@ -168,34 +168,24 @@ pub fn new(
     if settings.fd >= 0 {
         cfg.raw_fd(settings.fd);
     } else if settings.auto {
-        cfg.name(&*option::DEFAULT_TUN_NAME)
+        cfg.tun_name(&*option::DEFAULT_TUN_NAME)
             .address(&*option::DEFAULT_TUN_IPV4_ADDR)
             .destination(&*option::DEFAULT_TUN_IPV4_GW)
             .mtu(1500);
 
-        #[cfg(not(any(
-            target_arch = "mips",
-            target_arch = "mips64",
-            target_arch = "mipsel",
-            target_arch = "mipsel64",
-        )))]
+        #[cfg(not(any(target_arch = "mips", target_arch = "mips64")))]
         {
             cfg.netmask(&*option::DEFAULT_TUN_IPV4_MASK);
         }
 
         cfg.up();
     } else {
-        cfg.name(settings.name)
+        cfg.tun_name(settings.name)
             .address(settings.address)
             .destination(settings.gateway)
-            .mtu(settings.mtu);
+            .mtu(settings.mtu as u16);
 
-        #[cfg(not(any(
-            target_arch = "mips",
-            target_arch = "mips64",
-            target_arch = "mipsel",
-            target_arch = "mipsel64",
-        )))]
+        #[cfg(not(any(target_arch = "mips", target_arch = "mips64")))]
         {
             cfg.netmask(settings.netmask);
         }
@@ -246,7 +236,7 @@ pub fn new(
             while let Some(pkt) = stack_stream.next().await {
                 match pkt {
                     Ok(pkt) => {
-                        if let Err(e) = tun_sink.send(TunPacket::new(pkt)).await {
+                        if let Err(e) = tun_sink.send(pkt).await {
                             // TODO Return the error
                             error!("Sending packet to TUN failed: {}", e);
                             return;
@@ -265,7 +255,7 @@ pub fn new(
             while let Some(pkt) = tun_stream.next().await {
                 match pkt {
                     Ok(pkt) => {
-                        if let Err(e) = stack_sink.send(pkt.into_bytes().into()).await {
+                        if let Err(e) = stack_sink.send(pkt).await {
                             error!("Sending packet to NetStack failed: {}", e);
                             return;
                         }
